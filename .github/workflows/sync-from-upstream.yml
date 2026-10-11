@@ -1,0 +1,56 @@
+name: Sync from Upstream
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  sync:
+    name: 업스트림에서 동기화
+    runs-on: ubuntu-latest
+    steps:
+      - name: 체크아웃 (전체 히스토리 포함)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+      - name: 업스트림 리모트 추가
+        run: |
+          git remote add upstream https://github.com/doldolma/Dolgate.git
+          git fetch upstream --tags --prune
+      - name: 업스트림 브랜치 목록 확인
+        run: |
+          echo "=== 업스트림 브랜치 ==="
+          git branch -r | grep upstream
+      - name: main 브랜치 동기화
+        run: |
+          git checkout main
+          git merge upstream/main --no-edit --allow-unrelated-histories || true
+          git push origin main
+      - name: release/* 브랜치 동기화
+        run: |
+          for branch in $(git branch -r | grep 'upstream/release/' | sed 's/.*upstream\///'); do
+            echo "동기화 중: $branch"
+            git checkout -B "$branch" "upstream/$branch" || continue
+            git push origin "$branch" --force-with-lease || true
+          done
+      - name: hotfix/* 브랜치 동기화
+        run: |
+          for branch in $(git branch -r | grep 'upstream/hotfix/' | sed 's/.*upstream\///'); do
+            echo "동기화 중: $branch"
+            git checkout -B "$branch" "upstream/$branch" || continue
+            git push origin "$branch" --force-with-lease || true
+          done
+      - name: 태그 동기화
+        run: |
+          git fetch upstream --tags
+          git push origin --tags --force-with-lease || true
+      - name: 동기화 완료 알림
+        if: always()
+        run: |
+          echo "✅ 업스트림 동기화 완료"
+          echo "날짜: $(date -u)"
+          echo "커밋: ${{ github.sha }}"
