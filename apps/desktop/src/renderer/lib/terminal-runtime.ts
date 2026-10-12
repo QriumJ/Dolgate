@@ -9,11 +9,25 @@ import {
   type IDisposable,
   type ITerminalAddon,
   type ITerminalOptions,
-  type ITheme
+  type ITheme,
+  type IWindowsPty
 } from '@xterm/xterm';
 import { openTerminalExternalUrl } from '../services/desktop/terminal';
 
 const WRITE_FLUSH_THRESHOLD_BYTES = 64 * 1024;
+
+/**
+ * Windows ConPTY 를 거치는 세션(isConptyHostedTab)의 xterm 에 주는 값.
+ *
+ * ConPTY 는 행이 늘면 자기 화면을 위쪽 정렬로 다시 그리고 아래에 빈 행을 붙인다. xterm 은 기본으로
+ * 스크롤백을 끌어내려 화면을 채우는데, 그 위에 ConPTY 의 재그리기가 덮이면 글자는 늘어난 행 수만큼
+ * 위로 올라가고 마커(명령 블록 점)는 제자리에 남으며, 그 사이 스크롤백 줄이 덮여 사라진다(실측:
+ * 39→53행에서 14행 어긋남, 14줄 소실). backend 를 주면 xterm 도 ConPTY 처럼 아래에 빈 행만 붙인다.
+ *
+ * buildNumber 는 주지 않는다. 그 값이 바꾸는 것은 21376 미만(Windows 10)에서 reflow 를 끄고 줄 끝
+ * 글자로 접힘을 추정하는 것뿐인데, 그게 우리 앱에 나은지 확인할 수 없어서 지금의 reflow 를 유지한다.
+ */
+export const CONPTY_WINDOWS_PTY: IWindowsPty = { backend: 'conpty' };
 
 export interface TerminalRuntimeAppearance {
   theme: ITheme;
@@ -37,6 +51,8 @@ export interface TerminalRuntime {
   /** 스크롤백까지 포함해 직렬화한다. 터미널 재생성 시 버퍼 복원용. */
   captureRestoreSnapshot: () => string;
   setAppearance: (appearance: TerminalRuntimeAppearance) => void;
+  /** 만든 뒤 세션이 ConPTY 를 거치는지가 바뀌면 부른다(CONPTY_WINDOWS_PTY). undefined 면 해제. */
+  setWindowsPty: (windowsPty: IWindowsPty | undefined) => void;
   setWebglEnabled: (enabled: boolean) => Promise<void>;
   /** GPU/WebGL 컨텍스트 손실(절전·깨우기 등) 후 강제 재렌더 + 필요 시 WebGL 재생성. */
   repaint: () => void;
@@ -99,6 +115,8 @@ interface CreateTerminalRuntimeOptions {
    * 쓰인 내용은 뒤에 칸 수를 바로잡아도 되돌아오지 않는다(줄이 감기고 밀린 채 다시 흐른다).
    */
   initialSize?: { cols: number; rows: number };
+  /** 세션이 Windows ConPTY 를 거치면 CONPTY_WINDOWS_PTY. 그 밖에는 주지 않는다(xterm 기본값). */
+  windowsPty?: IWindowsPty;
   onData: (data: string) => void;
   onBinary: (data: string) => void;
   /**
@@ -153,11 +171,13 @@ function defaultOpenExternal(url: string): void | Promise<void> {
 function buildTerminalOptions(
   appearance: TerminalRuntimeAppearance,
   initialSize?: { cols: number; rows: number },
+  windowsPty?: IWindowsPty,
 ): ITerminalOptions {
   return {
     ...(initialSize && initialSize.cols > 0 && initialSize.rows > 0
       ? { cols: initialSize.cols, rows: initialSize.rows }
       : {}),
+    ...(windowsPty ? { windowsPty } : {}),
     // 명령 블록 오버레이가 쓰는 marker/decoration 은 xterm 5.x 에서 proposed API 라
     // 이 옵션이 없으면 registerDecoration 이 예외를 던진다(OSC 핸들러 안이라 파싱 루프가
     // 끊겨 터미널이 그 자리에서 멈춘다). unicode11 addon 등록에도 필요하다.
@@ -327,9 +347,10 @@ export function createTerminalRuntime({
   onCwd,
   dependencies = {},
   initialSize,
+  windowsPty,
 }: CreateTerminalRuntimeOptions): TerminalRuntime {
   const terminal = (dependencies.createTerminal ?? ((options) => new Terminal(options)))(
-    buildTerminalOptions(appearance, initialSize),
+    buildTerminalOptions(appearance, initialSize, windowsPty),
   );
   // 격자가 밖에서 고정된 터미널인가(initialSize 주석). 이 값이 true 면 어디서도 컨테이너에 fit 하지
   // 않는다.
@@ -705,6 +726,10 @@ export function createTerminalRuntime({
     },
     setAppearance(nextAppearance) {
       applyTerminalAppearance(terminal, nextAppearance);
+    },
+    setWindowsPty(nextWindowsPty) {
+      // 빈 객체가 xterm 기본값이다(ConPTY 아님).
+      terminal.options.windowsPty = nextWindowsPty ?? {};
     },
     setWebglEnabled(enabled) {
       return applyWebglEnabled(enabled);

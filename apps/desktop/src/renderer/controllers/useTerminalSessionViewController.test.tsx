@@ -42,6 +42,7 @@ vi.mock('../lib/terminal-command-blocks', async (importOriginal) => ({
 }));
 
 vi.mock('../lib/terminal-runtime', () => ({
+  CONPTY_WINDOWS_PTY: { backend: 'conpty' },
   createTerminalRuntime: vi.fn(
     ({
       container,
@@ -66,6 +67,8 @@ vi.mock('../lib/terminal-runtime', () => ({
         // 블록 오버레이가 스크롤/렌더에 맞춰 위치를 다시 계산하려고 구독한다.
         onRender: vi.fn(() => ({ dispose: vi.fn() })),
         onScroll: vi.fn(() => ({ dispose: vi.fn() })),
+        // ConPTY 세션은 리사이즈 뒤 다시 그려진 출력을 기다려 블록 위치를 맞춘다.
+        onWriteParsed: vi.fn(() => ({ dispose: vi.fn() })),
         buffer: {
           active: { type: 'normal', viewportY: 0, baseY: 0, cursorX: 0, cursorY: 0 },
         },
@@ -634,6 +637,74 @@ describe('useTerminalSessionViewController', () => {
 
     expect(record.scheduler.reset.mock.calls.length).toBeGreaterThan(resetsBefore);
     expect(record.scheduler.request.mock.calls.length).toBeGreaterThan(requestsBefore);
+  });
+
+  // Windows 로컬 셸은 ConPTY 안에서 돈다. ConPTY 는 리사이즈 때 자기 화면 사본을 위쪽부터 다시
+  // 그리므로 xterm 이 그것을 알아야 하고(windowsPty), 다시 그려진 뒤 명령 블록 위치를 맞춰야 한다.
+  // 원격 PTY 를 쓰는 세션에는 둘 다 걸지 않는다.
+  describe('Windows ConPTY 세션', () => {
+    const localTab: TerminalTab = {
+      ...baseTab,
+      source: 'local',
+      hostId: null,
+      shellKind: 'powershell',
+    };
+
+    function setPlatform(platform: string) {
+      Object.defineProperty(window.navigator, 'platform', {
+        configurable: true,
+        value: platform,
+      });
+    }
+
+    beforeEach(() => {
+      vi.mocked(createTerminalRuntime).mockClear();
+      setPlatform('Win32');
+    });
+
+    afterEach(() => {
+      delete (window.navigator as unknown as Record<string, unknown>).platform;
+    });
+
+    async function renderAndSettle(tab: TerminalTab) {
+      const view = renderController(createProps({ tab, host: undefined }));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(50);
+      });
+      // 만들다 실패해 옵션이 비어 보이는 것과 구별한다.
+      expect(vi.mocked(createTerminalRuntime)).toHaveBeenCalledTimes(1);
+      const [options] = vi.mocked(createTerminalRuntime).mock.calls[0] ?? [];
+      return { view, options, runtime: mocks.runtimeRecords.at(-1) };
+    }
+
+    it('로컬 셸 탭은 xterm 을 ConPTY 용으로 만들고, 리사이즈 뒤 다시 그려진 출력을 기다린다', async () => {
+      const { view, options, runtime } = await renderAndSettle(localTab);
+
+      expect(options?.windowsPty).toEqual({ backend: 'conpty' });
+      // 처음 크기를 보낼 때 출력 파싱을 구독한다 — 그 뒤 들어오는 재그리기에 블록을 맞춘다.
+      expect(runtime.terminal.onWriteParsed).toHaveBeenCalledTimes(1);
+
+      const subscription = runtime.terminal.onWriteParsed.mock.results[0]?.value;
+      view.unmount();
+      expect(subscription.dispose).toHaveBeenCalled();
+    });
+
+    it('ECS exec 탭과 원격 세션은 ConPTY 용 처리를 하지 않는다', async () => {
+      for (const tab of [{ ...localTab, shellKind: 'aws-ecs-exec' }, baseTab]) {
+        vi.mocked(createTerminalRuntime).mockClear();
+        const { view, options, runtime } = await renderAndSettle(tab);
+        expect(options?.windowsPty).toBeUndefined();
+        expect(runtime.terminal.onWriteParsed).not.toHaveBeenCalled();
+        view.unmount();
+      }
+    });
+
+    it('Windows 가 아니면 로컬 셸도 ConPTY 용 처리를 하지 않는다', async () => {
+      setPlatform('MacIntel');
+      const { options, runtime } = await renderAndSettle(localTab);
+      expect(options?.windowsPty).toBeUndefined();
+      expect(runtime.terminal.onWriteParsed).not.toHaveBeenCalled();
+    });
   });
 
   // tmux pane 의 xterm 은 **tmux 가 방금 보낸 레이아웃 칸 수 그대로** 만들어져야 한다. 마운트되면

@@ -14,6 +14,7 @@ import type {
 import { classifyCommandExit } from '@shared';
 import type { Terminal } from '@xterm/xterm';
 import {
+  CONPTY_WINDOWS_PTY,
   createTerminalRuntime,
   type TerminalRuntime,
 } from '../lib/terminal-runtime';
@@ -38,6 +39,7 @@ import {
 import {
   beginCommandBlock,
   clearCommandBlocks,
+  createConptyBlockRealigner,
   getCommandCount,
   finishCommandBlock,
   getCommandBlocks,
@@ -46,6 +48,7 @@ import {
   notePromptCommandStart,
   noteReportedCommand,
   readBlockOutput,
+  type ConptyBlockRealigner,
 } from '../lib/terminal-command-blocks';
 import { useTerminalBlockOverlay } from './useTerminalBlockOverlay';
 import type { TerminalCommandPaletteItem } from '../components/terminal-workspace/TerminalCommandPalette';
@@ -92,6 +95,7 @@ import {
   canShareSessionTab,
   didTerminalSessionJustConnect,
   getVisibleSessionShareChatNotifications,
+  isConptyHostedTab,
   isPendingConnectionSessionId,
   mergeSessionShareSnapshotKinds,
   resolveConnectionOverlayMessage,
@@ -148,6 +152,14 @@ function isMacPlatform(): boolean {
   }
 
   return /mac/i.test(navigator.userAgent) || /mac/i.test(navigator.platform);
+}
+
+function isWindowsPlatform(): boolean {
+  if (typeof navigator === 'undefined') {
+    return false;
+  }
+
+  return /^win/i.test(navigator.platform);
 }
 
 function debugSessionShareRenderer(
@@ -269,6 +281,10 @@ export function useTerminalSessionViewController({
   const liveTmuxCellRef = useRef<{ cols: number; rows: number } | null>(
     tmuxCell ?? null,
   );
+  // 출력이 Windows ConPTY 를 거쳐 오는가. xterm 을 만들 때 windowsPty 를 정하고, 리사이즈 뒤
+  // ConPTY 가 다시 그린 화면에 명령 블록 위치를 맞출지 정한다(isConptyHostedTab).
+  const conptyHosted = isConptyHostedTab(tab, isWindowsPlatform());
+  const liveConptyHostedRef = useRef(conptyHosted);
   // xterm 이 생기기 전에 도착한 출력. tmux pane 은 레이아웃을 알기 전엔 xterm 을 만들지 않는데,
   // 백로그(재연결 복원 포함)는 구독 즉시 흘러오므로 그 사이 온 바이트를 여기 들고 있다.
   const pendingWritesRef = useRef<Uint8Array[]>([]);
@@ -674,6 +690,15 @@ export function useTerminalSessionViewController({
     tmuxPrefixArmedRef.current = false;
   }, [tab?.tmux, tmuxPrefixKey, sessionId]);
 
+  // 만든 뒤에 바뀐 경우만 xterm 에 반영한다 — 만들 때는 createTerminalRuntime 이 넣는다.
+  useEffect(() => {
+    if (liveConptyHostedRef.current === conptyHosted) {
+      return;
+    }
+    liveConptyHostedRef.current = conptyHosted;
+    runtimeRef.current?.setWindowsPty(conptyHosted ? CONPTY_WINDOWS_PTY : undefined);
+  }, [conptyHosted]);
+
   // tmux 레이아웃 칸 수가 바뀌면(분할/리사이즈로 %layout-change) xterm 을 그 크기로 다시 고정한다.
   //
   // **스케줄러를 기다리지 않고 즉시 적용한다.** 원격 출력(%output)은 xterm 에 곧바로 쓰이는데 격자
@@ -1023,6 +1048,7 @@ export function useTerminalSessionViewController({
         container: containerRef.current,
         appearance,
         initialSize: tmuxCellAtMount ?? undefined,
+        windowsPty: liveConptyHostedRef.current ? CONPTY_WINDOWS_PTY : undefined,
         onData: (data) => {
           const currentSessionId = liveSessionIdRef.current;
           const currentStatus = liveSessionStatusRef.current;
@@ -1245,6 +1271,8 @@ export function useTerminalSessionViewController({
         }
       });
     }
+    // ConPTY 세션에서만, 처음 리사이즈를 보낼 때 만든다.
+    let conptyRealigner: ConptyBlockRealigner | null = null;
     resizeSchedulerRef.current = createTerminalResizeScheduler({
       // 세션 패널이 여닫히는 0.15초 동안은 재지 않는다 — 프레임마다 격자가 바뀌면 PTY·tmux 로
       // 리사이즈가 쏟아진다. 전환이 끝나면 아래 구독이 한 번 요청한다.
@@ -1290,6 +1318,14 @@ export function useTerminalSessionViewController({
         // 공유 → pane 별 보고가 서로 덮어써 셰이크). 대신 워크스페이스가 total 을 1회 보고.
         if (liveIsTmuxPaneRef.current) {
           return;
+        }
+        // ConPTY 는 이 크기를 받고 화면을 다시 그린다 — 그것이 들어오면 블록 위치를 맞춘다.
+        if (liveConptyHostedRef.current) {
+          conptyRealigner ??= createConptyBlockRealigner(
+            runtime.terminal,
+            () => liveSessionIdRef.current,
+          );
+          conptyRealigner.noteResize();
         }
         return liveOnResizeSessionRef.current(liveSessionIdRef.current, cols, rows);
       },
@@ -1339,6 +1375,7 @@ export function useTerminalSessionViewController({
       containerRef.current?.removeEventListener('focusout', handleFocusOut);
       resizeSchedulerRef.current?.reset();
       resizeSchedulerRef.current = null;
+      conptyRealigner?.dispose();
       unregisterTerminalHooks(stableId, terminalHooks);
       clearSessionCwd(liveSessionIdRef.current);
       clearCommandBlocks(liveSessionIdRef.current);

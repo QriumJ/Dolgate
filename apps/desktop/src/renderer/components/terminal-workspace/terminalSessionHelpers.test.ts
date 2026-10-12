@@ -4,6 +4,7 @@ import { t } from "../../i18n";
 import { resolveConnectionFailurePresentation } from "../../store/utils";
 import {
   canReadHostMetrics,
+  isConptyHostedTab,
   resolveAwsFailureNotice,
   resolveConnectionOverlayMessage,
   resolveConnectionOverlayTitle,
@@ -296,6 +297,29 @@ describe("canReadHostMetrics", () => {
     expect(canReadHostMetrics({ ...connected, tmux: { paneId: "%0" } })).toBe(false);
     expect(canReadHostMetrics(null)).toBe(false);
     expect(canReadHostMetrics({ source: "serial", status: "connected" })).toBe(false);
+  });
+});
+
+/**
+ * ConPTY 를 거치는 탭에만 xterm 의 windowsPty 와 리사이즈 뒤 블록 맞추기를 건다. 원격 PTY 를 쓰는
+ * 세션에 걸면 행이 늘 때 스크롤백을 내리지 않는 등, 필요 없는 ConPTY 용 처리가 끼어든다.
+ */
+describe("isConptyHostedTab", () => {
+  it("Windows 의 로컬 셸은 ConPTY 를 거친다", () => {
+    for (const shellKind of [undefined, "pwsh", "powershell", "cmd"]) {
+      expect(isConptyHostedTab({ source: "local", shellKind }, true)).toBe(true);
+    }
+  });
+
+  // source 는 'local' 이지만 코어가 SSM 데이터 채널에 직접 붙는다.
+  it("ECS exec 탭은 ConPTY 를 거치지 않는다", () => {
+    expect(isConptyHostedTab({ source: "local", shellKind: "aws-ecs-exec" }, true)).toBe(false);
+  });
+
+  it("원격 세션과 Windows 가 아닌 로컬 셸은 해당 없다", () => {
+    expect(isConptyHostedTab({ source: "host", shellKind: "ssh" }, true)).toBe(false);
+    expect(isConptyHostedTab({ source: "local", shellKind: "zsh" }, false)).toBe(false);
+    expect(isConptyHostedTab(null, true)).toBe(false);
   });
 });
 

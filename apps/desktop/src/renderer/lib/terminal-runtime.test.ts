@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { IDisposable } from '@xterm/xterm';
-import { createTerminalRuntime, type TerminalRuntimeAppearance } from './terminal-runtime';
+import {
+  CONPTY_WINDOWS_PTY,
+  createTerminalRuntime,
+  type TerminalRuntimeAppearance,
+} from './terminal-runtime';
 
 function createAppearance(): TerminalRuntimeAppearance {
   return {
@@ -127,6 +131,40 @@ describe('terminal-runtime', () => {
     const options = createTerminal.mock.calls[0]?.[0] as Record<string, unknown>;
     expect(options).not.toHaveProperty('cols');
     expect(options).not.toHaveProperty('rows');
+  });
+
+  // ConPTY 를 거치는 세션만 windowsPty 를 받는다. 주지 않으면 생성 옵션에 아예 없다(아래 생성
+  // 옵션 테스트) — 원격 PTY 세션에 ConPTY 용 처리가 끼어들면 안 된다.
+  it('windowsPty 를 주면 생성 옵션에 넣고, 만든 뒤에는 바꾸거나 해제할 수 있다', () => {
+    const container = document.createElement('div');
+    const { terminal } = createFakeTerminal();
+    const createTerminal = vi.fn().mockReturnValue(terminal);
+    const runtime = createTerminalRuntime({
+      container,
+      appearance: createAppearance(),
+      windowsPty: CONPTY_WINDOWS_PTY,
+      onData: vi.fn(),
+      onBinary: vi.fn(),
+      dependencies: {
+        createTerminal: createTerminal as never,
+        createFitAddon: (() => ({ fit: vi.fn(), activate: vi.fn(), dispose: vi.fn() })) as never,
+        createSearchAddon: (() => ({
+          activate: vi.fn(), dispose: vi.fn(), findNext: vi.fn(() => true),
+          findPrevious: vi.fn(() => true), clearDecorations: vi.fn(), clearActiveDecoration: vi.fn()
+        })) as never,
+        createUnicode11Addon: (() => ({ activate: vi.fn(), dispose: vi.fn() })) as never,
+        openExternal: vi.fn()
+      }
+    });
+    // 빌드 번호는 일부러 주지 않는다 — 그것이 바꾸는 것은 Windows 10 의 reflow 뿐이다.
+    expect(createTerminal).toHaveBeenCalledWith(
+      expect.objectContaining({ windowsPty: { backend: 'conpty' } })
+    );
+
+    runtime.setWindowsPty(undefined);
+    expect((terminal.options as Record<string, unknown>).windowsPty).toEqual({});
+    runtime.setWindowsPty(CONPTY_WINDOWS_PTY);
+    expect((terminal.options as Record<string, unknown>).windowsPty).toEqual({ backend: 'conpty' });
   });
 
   // 실기기에서 두 번째 tmux 창이 깨진 원인. initialSize 로 만들어도 open() 직후 컨테이너에 fit 하면

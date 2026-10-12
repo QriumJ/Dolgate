@@ -1,8 +1,10 @@
 import { Terminal } from '@xterm/xterm';
-import { afterEach, describe, expect, it } from 'vitest';
+import { Terminal as HeadlessTerminal } from '@xterm/headless';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   beginCommandBlock,
   clearCommandBlocks,
+  createConptyBlockRealigner,
   finishCommandBlock,
   getCommandBlockAtLine,
   getCommandBlockRange,
@@ -14,6 +16,7 @@ import {
   notePromptCommandStart,
   noteReportedCommand,
   readBlockOutput,
+  realignCommandBlocks,
   unescapeReportedCommand,
   subscribeToCommandBlocks,
 } from './terminal-command-blocks';
@@ -68,9 +71,19 @@ function createFakeTerminal(rows: string[] = [], wrappedLines: number[] = []) {
     },
   };
   const scrolledTo: number[] = [];
+  const writeParsedListeners: (() => void)[] = [];
 
   const terminal = {
+    rows: 24,
     buffer: { get active() { return buffer; } },
+    onWriteParsed(listener: () => void) {
+      writeParsedListeners.push(listener);
+      return {
+        dispose() {
+          writeParsedListeners.splice(writeParsedListeners.indexOf(listener), 1);
+        },
+      };
+    },
     registerMarker(offset = 0) {
       markerId += 1;
       const disposeCallbacks: (() => void)[] = [];
@@ -121,6 +134,12 @@ function createFakeTerminal(rows: string[] = [], wrappedLines: number[] = []) {
     markers,
     decorations,
     scrolledTo,
+    /** xterm 이 쓰기 데이터를 다 파싱했다고 알린다. */
+    fireWriteParsed() {
+      for (const listener of [...writeParsedListeners]) {
+        listener();
+      }
+    },
   };
 }
 
@@ -904,5 +923,249 @@ describe('이어지는 줄의 프롬프트(OSC 133;B;2)', () => {
     fake.buffer.cursorX = 2;
     expect(() => noteContinuationPrompt(SESSION, fake.terminal)).not.toThrow();
     expect(getCommandBlocks(SESSION)).toHaveLength(0);
+  });
+});
+
+/**
+ * Windows 로컬 셸은 ConPTY 안에서 돈다. ConPTY 는 리사이즈 때 자기 화면 사본을 다시 접어 위쪽부터
+ * 다시 그리는데, 접는 기준이 xterm 과 달라 글자는 옮겨 가고 xterm 마커는 제자리에 남는다(실측: 한국어
+ * Windows PowerShell 의 `ls` 뒤 최대화에서 21행). 가짜 터미널의 마커는 움직이지 않으므로 행 텍스트만
+ * 바꿔 그 상황을 만든다.
+ */
+describe('ConPTY 가 다시 그린 뒤 블록 위치 맞추기', () => {
+  const PROMPT = 'PS C:\\> ';
+
+  /** promptLine 의 프롬프트 뒤 명령을 B→C→D 로 기록한다. 출력은 outputEnd 바로 위 줄까지다. */
+  function recordCommand(
+    fake: ReturnType<typeof createFakeTerminal>,
+    promptLine: number,
+    outputEnd: number,
+  ) {
+    fake.buffer.cursorY = promptLine;
+    fake.buffer.cursorX = PROMPT.length;
+    notePromptCommandStart(SESSION, fake.terminal);
+    fake.buffer.cursorY = promptLine + 1;
+    fake.buffer.cursorX = 0;
+    beginCommandBlock(SESSION, fake.terminal, null);
+    fake.buffer.cursorY = outputEnd;
+    finishCommandBlock(SESSION, fake.terminal, 0);
+  }
+
+  /** 다음 프롬프트를 띄운다(B 만 오고 아직 실행하지 않은 상태). */
+  function showPrompt(fake: ReturnType<typeof createFakeTerminal>, line: number) {
+    fake.buffer.cursorY = line;
+    fake.buffer.cursorX = PROMPT.length;
+    notePromptCommandStart(SESSION, fake.terminal);
+  }
+
+  function setUpTwoCommands() {
+    const rows = [
+      `${PROMPT}ls`,
+      'a',
+      '', // ConPTY 는 자기 사본에서 앞 줄에서 접힌 칸으로 안다 — 넓어지면 사라진다.
+      `${PROMPT}echo hi`,
+      'hi',
+      PROMPT,
+    ];
+    const fake = createFakeTerminal(rows);
+    recordCommand(fake, 0, 3);
+    recordCommand(fake, 3, 5);
+    showPrompt(fake, 5);
+    return { rows, fake };
+  }
+
+  /** ConPTY 가 넓어진 화면을 다시 그린 결과: 빈 행이 사라져 그 아래가 한 줄씩 올라가고 커서도 올라간다. */
+  function repaintAfterWiden(rows: string[], fake: ReturnType<typeof createFakeTerminal>) {
+    rows.splice(2, 1);
+    rows.push('');
+    fake.buffer.cursorY = 4;
+  }
+
+  it('명령 줄이 올라가면 블록과 입력 중인 프롬프트를 그 줄로 옮긴다', () => {
+    const { rows, fake } = setUpTwoCommands();
+    const [first, second] = getCommandBlocks(SESSION);
+    const oldDecoration = fake.decorations[1];
+
+    repaintAfterWiden(rows, fake);
+    expect(rows[second.marker.line]).toBe('hi');
+
+    expect(realignCommandBlocks(SESSION, fake.terminal)).toBe(1);
+    expect(first.marker.line).toBe(0);
+    expect(second.marker.line).toBe(2);
+    // 출력 끝도 같이 옮겨야 hover 영역이 다음 프롬프트를 덮지 않는다.
+    expect(second.endLine).toBe(3);
+    // 옛 점은 치우고 새 줄에 다시 단다.
+    expect(oldDecoration.disposed).toBe(true);
+    expect(second.decoration).not.toBeNull();
+    expect(second.decoration).not.toBe(oldDecoration);
+
+    // 프롬프트를 안 옮기면 다음 명령이 빈 줄에서 읽혀 명령도 점 위치도 틀린다.
+    rows[4] = `${PROMPT}pwd`;
+    fake.buffer.cursorY = 5;
+    fake.buffer.cursorX = 0;
+    beginCommandBlock(SESSION, fake.terminal, null);
+    const next = getCommandBlocks(SESSION)[2];
+    expect(next.command).toBe('pwd');
+    expect(next.marker.line).toBe(4);
+  });
+
+  it('옮긴 뒤 옛 마커가 사라져도 블록의 점은 남는다', () => {
+    const { rows, fake } = setUpTwoCommands();
+    const second = getCommandBlocks(SESSION)[1];
+    const oldMarker = second.marker;
+
+    repaintAfterWiden(rows, fake);
+    realignCommandBlocks(SESSION, fake.terminal);
+
+    oldMarker.dispose();
+    expect(second.decoration).not.toBeNull();
+  });
+
+  // 같은 명령을 연달아 쳤고, 줄이 아래로 밀리면서(창을 좁힐 때) 뒤 블록의 마커가 앞 블록의 명령 줄에
+  // 겹쳤다. 텍스트만 보면 맞아 보이지만 그 줄은 앞 블록 것이다 — 더 최근 블록부터 찾아야 섞이지 않는다.
+  it('같은 명령을 연달아 쳤어도 서로의 줄로 가지 않는다', () => {
+    const rows = [`${PROMPT}ls`, 'x', `${PROMPT}ls`, 'y', PROMPT];
+    const fake = createFakeTerminal(rows);
+    recordCommand(fake, 0, 2);
+    recordCommand(fake, 2, 4);
+    showPrompt(fake, 4);
+    const [first, second] = getCommandBlocks(SESSION);
+
+    rows.unshift('older-1', 'older-2');
+    fake.buffer.cursorY = 6;
+    expect(rows[second.marker.line]).toBe(`${PROMPT}ls`);
+
+    expect(realignCommandBlocks(SESSION, fake.terminal)).toBe(2);
+    expect(first.marker.line).toBe(2);
+    expect(second.marker.line).toBe(4);
+  });
+
+  it('명령 줄을 찾지 못하면 옮기지 않는다', () => {
+    const rows = [`${PROMPT}ls`, 'a', PROMPT];
+    const fake = createFakeTerminal(rows);
+    recordCommand(fake, 0, 2);
+    showPrompt(fake, 2);
+    const [block] = getCommandBlocks(SESSION);
+
+    rows[0] = 'overwritten';
+    expect(realignCommandBlocks(SESSION, fake.terminal)).toBe(0);
+    expect(block.marker.line).toBe(0);
+  });
+
+  it('리사이즈 뒤 출력이 조용해지면 한 번 맞추고, 기다리는 시간이 지나면 더는 맞추지 않는다', () => {
+    vi.useFakeTimers();
+    try {
+      const { rows, fake } = setUpTwoCommands();
+      const second = getCommandBlocks(SESSION)[1];
+      const realigner = createConptyBlockRealigner(fake.terminal, () => SESSION);
+
+      realigner.noteResize();
+      repaintAfterWiden(rows, fake);
+      fake.fireWriteParsed();
+      vi.advanceTimersByTime(40);
+      // 재그리기가 여러 청크로 오면 마지막 청크 뒤까지 미룬다.
+      fake.fireWriteParsed();
+      vi.advanceTimersByTime(40);
+      expect(second.marker.line).toBe(3);
+      vi.advanceTimersByTime(10);
+      expect(second.marker.line).toBe(2);
+
+      // 리사이즈가 없었는데 화면이 바뀐 것은 맞추지 않는다(명령 출력일 뿐이다).
+      vi.advanceTimersByTime(3000);
+      rows.unshift('later');
+      fake.buffer.cursorY = 5;
+      fake.fireWriteParsed();
+      vi.advanceTimersByTime(100);
+      expect(second.marker.line).toBe(2);
+
+      realigner.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+/**
+ * 위 테스트는 "다시 그린 결과" 를 손으로 만든다. 여기서는 실제 xterm 에 ConPTY 가 보낸 것과 같은
+ * 모양의 바이트를 흘려 넣어 그 결과가 정말 그렇게 되는지 확인한다.
+ *
+ * 실측한 모양: 한국어 Windows PowerShell 의 `ls` 표는 줄마다 폭보다 1칸 길다. ConPTY 는 그 줄을
+ * 폭만큼 채운 줄과 빈 줄, 둘로 보낸다(xterm 버퍼에는 접힘 표시가 없다). 창을 넓히면 ConPTY 는 자기
+ * 사본에서 그 둘을 한 줄로 펴고 화면을 위쪽부터 `\e[H … \e[K` 로 다시 그린 뒤 커서를 옮긴다.
+ */
+describe('ConPTY 가 다시 그린 뒤 블록 위치 맞추기 (실제 xterm)', () => {
+  const session = 'conpty-repaint';
+
+  afterEach(() => {
+    clearCommandBlocks(session);
+  });
+
+  it('넓어진 화면이 다시 그려져도 블록과 다음 명령이 제 줄에 붙는다', async () => {
+    const terminal = new HeadlessTerminal({
+      cols: 20,
+      rows: 6,
+      scrollback: 100,
+      allowProposedApi: true,
+      windowsPty: { backend: 'conpty' },
+    });
+    // headless 에는 데코레이션이 없다 — 여기서 보는 것은 마커 위치다.
+    (terminal as unknown as { registerDecoration: () => undefined }).registerDecoration = () =>
+      undefined;
+    const term = terminal as unknown as Terminal;
+    const write = (data: string) =>
+      new Promise<void>((resolve) => {
+        terminal.write(data, resolve);
+      });
+    const lineText = (line: number) =>
+      terminal.buffer.active.getLine(line)?.translateToString(true);
+    const fullRow = (text: string) => text.padEnd(20, ' ');
+
+    try {
+      await write('filler-1\r\nfiller-2\r\n');
+      await write('PS> ');
+      notePromptCommandStart(session, term);
+      await write('ls\r\n');
+      beginCommandBlock(session, term, null);
+      await write(
+        `${fullRow('entry-1')}\r\n\x1b[K\r\n${fullRow('entry-2')}\r\n\x1b[K\r\n${fullRow('entry-3')}\r\n\x1b[K\r\n`,
+      );
+      finishCommandBlock(session, term, 0);
+      await write('PS> ');
+      notePromptCommandStart(session, term);
+      await write('echo hi\r\n');
+      beginCommandBlock(session, term, null);
+      await write('hi\r\n');
+      finishCommandBlock(session, term, 0);
+      await write('PS> ');
+      notePromptCommandStart(session, term);
+
+      // 활성 화면(마지막 6행): ['', 'entry-3', '', 'PS> echo hi', 'hi', 'PS> ']
+      expect(terminal.buffer.active.baseY).toBe(6);
+      const [ls, echo] = getCommandBlocks(session);
+      expect(lineText(echo.marker.line)).toBe('PS> echo hi');
+
+      terminal.resize(30, 6);
+      // ConPTY 의 사본: 맨 위 행은 앞(이미 스크롤된) 줄의 나머지라 그대로, entry-3 와 그 나머지는
+      // 한 줄로 펴지고, 아래에 빈 행이 생긴다. 지금 프롬프트 뒤 공백은 쓰지 않고 지운 뒤 커서만
+      // 옮긴다(실측: `PS C:\Users\Computer>\e[K\e[1C`) — B 때 기록한 프롬프트와 줄 끝이 다르다.
+      const conptyView = ['', 'entry-3', 'PS> echo hi', 'hi', 'PS>', ''];
+      await write(`\x1b[H${conptyView.join('\x1b[K\r\n')}\x1b[K\x1b[5;5H`);
+
+      // 맞추기 전: 글자는 한 행 올라갔고 마커는 제자리다.
+      expect(lineText(echo.marker.line)).toBe('hi');
+
+      expect(realignCommandBlocks(session, term)).toBe(1);
+      expect(lineText(echo.marker.line)).toBe('PS> echo hi');
+      expect(lineText(ls.marker.line)).toBe('PS> ls');
+
+      // 다음 명령도 제 줄에서 읽는다.
+      await write('pwd\r\n');
+      beginCommandBlock(session, term, null);
+      const next = getCommandBlocks(session)[2];
+      expect(next.command).toBe('pwd');
+      expect(lineText(next.marker.line)).toBe('PS> pwd');
+    } finally {
+      terminal.dispose();
+    }
   });
 });

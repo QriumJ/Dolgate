@@ -7,7 +7,7 @@
 // store 에 두지 않는 이유는 terminal-cwd-registry 와 같다 — 컨트롤러는 refs 기반이고,
 // 명령마다 전역 리렌더를 유발할 이유가 없다.
 
-import type { IDecoration, IMarker, Terminal } from '@xterm/xterm';
+import type { IBuffer, IDecoration, IMarker, Terminal } from '@xterm/xterm';
 import { classifyCommandExit } from '@shared';
 
 /**
@@ -29,8 +29,18 @@ export interface TerminalCommandBlock {
   startedAt: number;
   durationMs: number | null;
   cwd: string | null;
-  /** 명령 줄에 고정된 마커. 스크롤백에서 밀려나면 dispose 되고 블록도 제거된다. */
-  readonly marker: IMarker;
+  /**
+   * 명령 줄에 고정된 마커. 스크롤백에서 밀려나면 dispose 되고 위치를 잃는다.
+   *
+   * 갈아 끼울 수 있다 — ConPTY 가 리사이즈 뒤 화면을 다시 그려 명령 줄이 옮겨 가면
+   * realignCommandBlocks 가 그 줄에 새 마커를 붙인다.
+   */
+  marker: IMarker;
+  /**
+   * 블록을 만들 때 명령 줄(마커 행)에 보이던 텍스트. ConPTY 가 다시 그린 뒤 그 줄을 다시 찾는 데
+   * 쓴다(realignCommandBlocks). 마커 행이 비어 있었으면 null — 빈 줄로는 찾을 수 없다.
+   */
+  commandLineText: string | null;
   /** 명령이 끝난 시점의 절대 버퍼 행(출력의 끝). 완료 전에는 null. */
   endLine: number | null;
   decoration: IDecoration | null;
@@ -40,6 +50,8 @@ interface PendingPrompt {
   marker: IMarker;
   /** OSC 133;B 시점의 커서 X = 프롬프트가 끝나고 명령 텍스트가 시작되는 열. */
   promptEndX: number;
+  /** 그때 프롬프트(promptEndX 앞까지)의 텍스트. ConPTY 가 다시 그린 뒤 프롬프트 줄을 다시 찾는 데 쓴다. */
+  promptText: string;
   /**
    * 이어지는 줄(PS2)의 텍스트 시작 열. 절대 버퍼 행 → 열.
    *
@@ -222,6 +234,19 @@ function isNormalBuffer(terminal: Terminal): boolean {
 }
 
 /**
+ * 줄을 다시 찾을 때 비교하는 텍스트. 줄 끝 공백은 뗀다.
+ *
+ * 같은 줄도 줄 끝이 달라진다: 셸이 쓴 프롬프트 뒤 공백은 글자지만, ConPTY 가 다시 그릴 때는 그
+ * 자리를 `\e[K` 로 지우고 커서만 옮긴다. 게다가 xterm 의 translateToString(true, 0, n) 은 범위
+ * 끝의 공백을 떼지 않는다(줄 전체의 마지막 글자 기준으로만 자른다). 그대로 비교하면 다시 그려진
+ * 지금 프롬프트는 안 맞고, 공백이 그대로 남은 예전 명령 줄이 맞아 버렸다(실측).
+ */
+function lineTextForMatch(buffer: IBuffer, line: number, endColumn?: number): string | null {
+  const text = buffer.getLine(line)?.translateToString(true, 0, endColumn);
+  return text === undefined ? null : text.trimEnd();
+}
+
+/**
  * VS Code 처럼 명령 줄 옆 거터에 작은 점 하나만 찍는다. 출력 범위를 덮는 세로 바는 쓰지 않는다
  * — 글자와 겹치고, 데코레이션 높이가 생성 시 고정이며, 마커 행이 화면 밖으로 나가면 xterm 이
  * 아예 그리지 않아 긴 출력에서 사라지기 때문이다.
@@ -273,6 +298,37 @@ function attachDecoration(terminal: Terminal, block: TerminalCommandBlock): void
   decoration.onRender((element) => {
     applyDecorationStyle(block, element);
   });
+}
+
+/**
+ * 블록에 마커를 붙이고 점을 단다.
+ *
+ * 마커가 사라져도 **기록은 남긴다.** 마커는 스크롤백이 절삭될 때, 그리고 `clear` 로 화면·스크롤백을
+ * 지울 때 사라진다. 예전에는 그때 블록을 목록에서 지웠는데, 그러면 `clear` 한 번에 히스토리가 통째로
+ * 날아간다 — 셸의 `history` 도 `clear` 로 지워지지 않는다.
+ *
+ * 그래서 잃는 것은 **위치뿐**이다: 거터의 점과 "이 명령 위치로 이동" 이 사라지고(그 행이 실제로
+ * 없어졌으므로 맞다), 명령·종료 코드·소요 시간·작업 디렉터리는 남는다. 위치를 쓰는 쪽은 모두
+ * `marker.line < 0` 을 건너뛴다.
+ */
+function bindBlockMarker(
+  session: SessionBlocks,
+  sessionId: string,
+  terminal: Terminal,
+  block: TerminalCommandBlock,
+  marker: IMarker,
+): void {
+  block.marker = marker;
+  marker.onDispose(() => {
+    // 위치를 다시 맞추느라 갈아 끼운 옛 마커다 — 블록은 새 마커로 살아 있다.
+    if (block.marker !== marker) {
+      return;
+    }
+    block.decoration?.dispose();
+    block.decoration = null;
+    notifyCommandBlocksChanged(session, sessionId);
+  });
+  attachDecoration(terminal, block);
 }
 
 function disposeBlock(block: TerminalCommandBlock): void {
@@ -470,10 +526,12 @@ export function notePromptCommandStart(sessionId: string, terminal: Terminal): v
     // 새 프롬프트가 떴으면 직전 명령의 E 는 쓸 데가 없다 — 남겨 두면 다음 블록에 붙는다.
     session.reportedCommand = null;
     const marker = terminal.registerMarker(0);
+    const buffer = terminal.buffer.active;
     session.pendingPrompt = marker
       ? {
           marker,
-          promptEndX: terminal.buffer.active.cursorX,
+          promptEndX: buffer.cursorX,
+          promptText: lineTextForMatch(buffer, marker.line, buffer.cursorX) ?? '',
           continuationEndX: new Map(),
         }
       : null;
@@ -576,6 +634,7 @@ function beginCommandBlockUnsafe(
     commandText = { text: commandText.text, unreliable: false };
   }
   session.seq += 1;
+  const commandLineText = lineTextForMatch(buffer, marker.line) ?? '';
   const block: TerminalCommandBlock = {
     id: session.seq,
     state: 'running',
@@ -587,26 +646,11 @@ function beginCommandBlockUnsafe(
     durationMs: null,
     cwd,
     marker,
+    commandLineText: commandLineText.length > 0 ? commandLineText : null,
     endLine: null,
     decoration: null,
   };
-  /**
-   * 마커가 사라져도 **기록은 남긴다.**
-   *
-   * 마커는 스크롤백이 절삭될 때, 그리고 `clear` 로 화면·스크롤백을 지울 때 사라진다. 예전에는
-   * 그때 블록을 목록에서 지웠는데, 그러면 `clear` 한 번에 히스토리가 통째로 날아간다 —
-   * 셸의 `history` 도 `clear` 로 지워지지 않는다.
-   *
-   * 그래서 잃는 것은 **위치뿐**이다: 거터의 점과 "이 명령 위치로 이동" 이 사라지고(그 행이
-   * 실제로 없어졌으므로 맞다), 명령·종료 코드·소요 시간·작업 디렉터리는 남는다. 위치를 쓰는
-   * 쪽은 모두 `marker.line < 0` 을 건너뛴다.
-   */
-  marker.onDispose(() => {
-    block.decoration?.dispose();
-    block.decoration = null;
-    notifyCommandBlocksChanged(session, sessionId);
-  });
-  attachDecoration(terminal, block);
+  bindBlockMarker(session, sessionId, terminal, block, marker);
 
   session.blocks.push(block);
   // 상한을 넘으면 오래된 것부터 실제로 버린다 — 마커가 사라지는 것(위치만 잃음)과 달리
@@ -816,6 +860,177 @@ function jumpToAdjacentCommandBlockUnsafe(
   }
   terminal.scrollToLine(target);
   return true;
+}
+
+/**
+ * ConPTY 가 리사이즈 뒤 화면을 다시 그려 글자가 옮겨 갔으면, 블록과 입력 중인 프롬프트의 마커를
+ * 글자가 있는 줄로 옮긴다. 옮긴 블록 수를 돌려준다.
+ *
+ * 왜 필요한가: Windows 로컬 셸은 ConPTY 안에서 돈다. ConPTY 는 화면 사본을 따로 들고 있다가
+ * 리사이즈 때 그 사본을 다시 접어 위쪽부터 다시 그리는데, 접는 기준이 xterm 과 다르다. 한국어
+ * Windows PowerShell 의 표는 줄마다 폭보다 1칸 길어(`오전/오후` 가 2칸) 접혀 있는데, ConPTY 는 그
+ * 줄들을 접힘이 아닌 별개의 줄로 보낸다. 창을 넓히면 ConPTY 는 자기 사본에서 그 줄들을 펴지만
+ * xterm 은 펼 것이 없다고 보고, 다시 그려진 글자만 펴진 줄 수만큼 위로 올라간다. 마커는 제자리에
+ * 남는다(실측: `ls` 뒤 최대화에서 21행). xterm 의 reflow 를 고쳐서는 닿지 않으므로 다시 그려진
+ * 결과를 보고 맞춘다.
+ *
+ * 찾는 법: 가장 최근 블록부터 거꾸로, 블록을 만들 때 적어 둔 명령 줄 텍스트와 같은 줄을 바로 다음
+ * (더 최근) 블록 줄의 위에서부터 위로 찾는다. 두 블록 사이에는 이 블록의 출력만 있으므로 처음 만나는
+ * 같은 줄이 이 블록이다 — 같은 명령을 연달아 쳐도 섞이지 않는다. 출력에 명령 줄과 똑같은 줄이
+ * 있으면 그 줄로 잘못 갈 수 있다. 못 찾으면 옮기지 않는다.
+ *
+ * 스크롤백에서 제자리가 맞는 블록을 만나면 멈춘다 — ConPTY 는 활성 화면만 다시 그리므로 그보다
+ * 오래된 블록은 영향받지 않는다.
+ */
+export function realignCommandBlocks(sessionId: string, terminal: Terminal): number {
+  return safely(sessionId, 0, () => realignCommandBlocksUnsafe(sessionId, terminal));
+}
+
+function realignCommandBlocksUnsafe(sessionId: string, terminal: Terminal): number {
+  const session = sessions.get(sessionId);
+  if (!session || !isNormalBuffer(terminal)) {
+    return 0;
+  }
+  const buffer = terminal.buffer.active;
+  const cursorLine = buffer.baseY + buffer.cursorY;
+  // 다시 그려지며 옮겨 갈 수 있는 거리. ConPTY 는 활성 화면만 다시 그리므로 그 두 배면 넉넉하다.
+  const reach = Math.max(terminal.rows, 1) * 2;
+
+  // 블록의 명령 줄은 이 줄보다 위에 있다. 처음에는 커서 줄(지금 프롬프트)이다.
+  let upperBound = cursorLine;
+
+  // 입력 중인 프롬프트(B 는 왔고 C 는 아직)도 옮긴다. 안 옮기면 다음 명령의 블록이 엉뚱한 줄에
+  // 생기고 명령 텍스트도 그 줄에서 읽는다. 지금 프롬프트는 커서 줄이거나 그 위(여러 줄 입력)이고
+  // 그보다 위의 프롬프트는 다 지난 명령이므로, 커서에서 위로 처음 만나는 프롬프트가 이것이다.
+  const pending = session.pendingPrompt;
+  if (pending && pending.marker.line >= 0 && pending.promptText.length > 0) {
+    const promptLine = findLineUpward(
+      cursorLine,
+      Math.max(0, cursorLine - reach),
+      (line) => lineTextForMatch(buffer, line, pending.promptEndX) === pending.promptText,
+    );
+    if (promptLine >= 0) {
+      const delta = promptLine - pending.marker.line;
+      const moved = delta === 0 ? null : terminal.registerMarker(promptLine - cursorLine);
+      if (moved) {
+        pending.marker.dispose();
+        pending.marker = moved;
+        pending.continuationEndX = new Map(
+          [...pending.continuationEndX].map(([line, x]) => [line + delta, x]),
+        );
+      }
+      upperBound = promptLine;
+    }
+  }
+
+  let movedCount = 0;
+  for (let index = session.blocks.length - 1; index >= 0; index -= 1) {
+    const block = session.blocks[index];
+    const current = block.marker.line;
+    const expected = block.commandLineText;
+    if (current < 0 || expected === null) {
+      continue;
+    }
+    const found = findLineUpward(
+      Math.min(upperBound - 1, current + reach),
+      Math.max(0, current - reach),
+      (line) => lineTextForMatch(buffer, line) === expected,
+    );
+    if (found < 0) {
+      continue;
+    }
+    if (found === current) {
+      if (current < buffer.baseY) {
+        break;
+      }
+      upperBound = found;
+      continue;
+    }
+    const marker = terminal.registerMarker(found - cursorLine);
+    if (!marker) {
+      continue;
+    }
+    const previous = block.marker;
+    block.decoration?.dispose();
+    block.decoration = null;
+    if (block.endLine !== null) {
+      block.endLine = Math.max(found, block.endLine + found - current);
+    }
+    bindBlockMarker(session, sessionId, terminal, block, marker);
+    previous.dispose();
+    movedCount += 1;
+    upperBound = found;
+  }
+  if (movedCount > 0) {
+    notifyCommandBlocksChanged(session, sessionId);
+  }
+  return movedCount;
+}
+
+/** from 부터 to 까지(둘 다 포함) 위로 올라가며 처음 맞는 줄. 없으면 -1. */
+function findLineUpward(
+  from: number,
+  to: number,
+  matches: (line: number) => boolean,
+): number {
+  for (let line = from; line >= to; line -= 1) {
+    if (matches(line)) {
+      return line;
+    }
+  }
+  return -1;
+}
+
+/** 리사이즈 뒤 ConPTY 의 재그리기를 기다리는 시간(ms). 실측으로는 수십 ms 안에 온다. */
+const CONPTY_REPAINT_WAIT_MS = 2000;
+/** 재그리기가 여러 청크로 와도 한 번만 맞추도록, 마지막 출력 뒤 이만큼 조용해지면 맞춘다(ms). */
+const CONPTY_REPAINT_SETTLE_MS = 50;
+
+export interface ConptyBlockRealigner {
+  /** 리사이즈를 PTY 로 보냈다 — 이어서 오는 재그리기가 끝나면 블록 위치를 맞춘다. */
+  noteResize(): void;
+  dispose(): void;
+}
+
+/**
+ * ConPTY 세션에서 리사이즈 뒤 다시 그려진 화면이 들어오면 realignCommandBlocks 를 부른다.
+ *
+ * 리사이즈 직후에는 맞출 수 없다 — xterm 은 이미 자기 버퍼를 바꿨지만 ConPTY 의 재그리기는 PTY 를
+ * 돌아 나중에 온다. 그래서 그 뒤 출력이 파싱될 때마다 미루다가 조용해지면 맞춘다. 기다리는 동안
+ * 명령 출력이 섞여 와도 상관없다 — 같은 화면에 여러 번 맞춰도 결과가 같다.
+ */
+export function createConptyBlockRealigner(
+  terminal: Terminal,
+  getSessionId: () => string,
+): ConptyBlockRealigner {
+  let waitUntil = 0;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const subscription = safely(getSessionId(), null, () =>
+    terminal.onWriteParsed(() => {
+      if (Date.now() > waitUntil) {
+        return;
+      }
+      if (timer !== null) {
+        clearTimeout(timer);
+      }
+      timer = setTimeout(() => {
+        timer = null;
+        realignCommandBlocks(getSessionId(), terminal);
+      }, CONPTY_REPAINT_SETTLE_MS);
+    }),
+  );
+  return {
+    noteResize() {
+      waitUntil = Date.now() + CONPTY_REPAINT_WAIT_MS;
+    },
+    dispose() {
+      subscription?.dispose();
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    },
+  };
 }
 
 /** 세션 종료·재연결 시 마커와 데코레이션을 모두 정리한다. */

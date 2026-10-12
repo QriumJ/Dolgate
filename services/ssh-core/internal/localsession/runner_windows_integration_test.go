@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -210,6 +211,30 @@ func TestResolveWindowsShellRuntimeWithLookupReportsAllSupportedShellFamilies(t 
 	}
 	if !strings.Contains(err.Error(), "pwsh.exe") || !strings.Contains(err.Error(), "powershell.exe") || !strings.Contains(err.Error(), "cmd.exe") {
 		t.Fatalf("error message = %q", err)
+	}
+}
+
+// 래퍼에게 콘솔을 UTF-8 로 바꾸게 하는 것은 PowerShell 7 뿐이다. Windows PowerShell 5.1 은 65001 에서
+// `ls` 항목 사이에 빈 줄이 생긴다. 옵션은 셸 경로 앞에 와야 래퍼가 자기 옵션으로 읽는다.
+func TestWrapperCommandArgsSwitchesConsoleToUTF8OnlyForPwsh(t *testing.T) {
+	const wrapperPath = `C:\bin\aws-conpty-wrapper.exe`
+	for _, tc := range []struct {
+		kind string
+		want []string
+	}{
+		{windowsShellKindPwsh, []string{wrapperPath, "--utf8-console", `C:\shell.exe`, "-NoLogo"}},
+		{windowsShellKindPowerShell, []string{wrapperPath, `C:\shell.exe`, "-NoLogo"}},
+		{windowsShellKindCmd, []string{wrapperPath, `C:\shell.exe`, "-NoLogo"}},
+	} {
+		got := wrapperCommandArgs(localCommandRuntime{
+			shellKind:      tc.kind,
+			executablePath: `C:\shell.exe`,
+			args:           []string{"-NoLogo"},
+			wrapperPath:    wrapperPath,
+		})
+		if !slices.Equal(got, tc.want) {
+			t.Errorf("%s: 래퍼 명령줄 = %q, want %q", tc.kind, got, tc.want)
+		}
 	}
 }
 

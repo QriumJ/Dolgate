@@ -130,9 +130,7 @@ func startPlatformLocalRunner(payload protocol.LocalConnectPayload, runtime loca
 
 	commandLine := windows.ComposeCommandLine(append([]string{runtime.executablePath}, runtime.args...))
 	if runtime.wrapperPath != "" {
-		wrapperArgs := []string{runtime.wrapperPath, runtime.executablePath}
-		wrapperArgs = append(wrapperArgs, runtime.args...)
-		commandLine = windows.ComposeCommandLine(wrapperArgs)
+		commandLine = windows.ComposeCommandLine(wrapperCommandArgs(runtime))
 	}
 	commandLine16, err := windows.UTF16PtrFromString(commandLine)
 	if err != nil {
@@ -187,6 +185,24 @@ func startPlatformLocalRunner(payload protocol.LocalConnectPayload, runtime loca
 		inputWriter:                  inputWriter,
 		outputReader:                 outputReader,
 	}, nil
+}
+
+// wrapperCommandArgs 는 래퍼를 거쳐 셸을 띄우는 명령줄이다. 래퍼 옵션은 셸 경로 앞에 둔다 — 래퍼는
+// 옵션이 아닌 첫 인자부터 끝까지를 띄울 명령으로 본다.
+//
+// 콘솔을 UTF-8(65001)로 바꾸게 하는 것은 PowerShell 7 뿐이다. UTF-8 이면 외부 프로그램(git 등)이
+// UTF-8 로 낸 출력을 변수·파이프로 받아도 한글이 깨지지 않는다. 그런데 Windows PowerShell 5.1 은
+// 65001 에서 표의 각 줄을 폭까지 공백으로 채우면서 한글을 1칸으로 세어, `오전/오후` 가 든 `ls` 의
+// 줄마다 1칸이 넘쳐 항목 사이에 빈 줄이 생긴다(앱 밖 일반 PowerShell 창에서도 같다). PowerShell 7 은
+// 65001 에서도 표가 멀쩡하다. 5.1 과 cmd 는 시스템 기본 코드 페이지 그대로 띄운다 — 변수로 받은
+// UTF-8 출력의 한글은 깨지지만, 일반 PowerShell 창과 같은 상태다.
+func wrapperCommandArgs(runtime localCommandRuntime) []string {
+	args := []string{runtime.wrapperPath}
+	if runtime.shellKind == windowsShellKindPwsh {
+		args = append(args, "--utf8-console")
+	}
+	args = append(args, runtime.executablePath)
+	return append(args, runtime.args...)
 }
 
 func resolveLocalRuntime(payload protocol.LocalConnectPayload) (localCommandRuntime, error) {

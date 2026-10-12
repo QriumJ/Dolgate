@@ -195,6 +195,24 @@ export function canReadHostMetrics(
   return tab.shellKind !== 'aws-ecs-exec';
 }
 
+/**
+ * 이 탭의 출력이 Windows ConPTY 를 거쳐 오는가.
+ *
+ * Windows 의 로컬 셸은 코어가 ConPTY 안에서 띄운다(localsession/runner_windows.go). ConPTY 는 화면
+ * 사본을 따로 들고 있다가 리사이즈 때 그 사본을 위쪽부터 다시 그려 보낸다 — xterm 이 자기 버퍼를
+ * 어떻게 바꿨든 그 위에 덮어쓴다. 그래서 xterm 이 이것을 알아야 하고(windowsPty), 다시 그려진 뒤에는
+ * 명령 블록 위치를 맞춰야 한다.
+ *
+ * ECS exec 탭은 source 가 'local' 이지만 코어가 SSM 데이터 채널에 직접 붙는다(connectAwsSession) —
+ * ConPTY 를 거치지 않는다. 원격 세션(SSH 등)은 원격에 진짜 PTY 가 있다.
+ */
+export function isConptyHostedTab(
+  tab: { source?: string | null; shellKind?: string | null } | null | undefined,
+  isWindows: boolean,
+): boolean {
+  return isWindows && tab?.source === 'local' && tab.shellKind !== 'aws-ecs-exec';
+}
+
 export function mergeSessionShareSnapshotKinds(
   currentKind: SessionShareSnapshotInput['kind'] | null,
   nextKind: SessionShareSnapshotInput['kind'],

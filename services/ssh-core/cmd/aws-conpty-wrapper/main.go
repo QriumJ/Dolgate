@@ -34,7 +34,9 @@ var (
 
 type wrapperConfig struct {
 	controlPipePath string
-	command         []string
+	// utf8Console 이면 명령을 띄우기 전에 콘솔 코드 페이지를 65001(UTF-8)로 바꾼다.
+	utf8Console bool
+	command     []string
 }
 
 type keyEventRecord struct {
@@ -72,9 +74,17 @@ func run(args []string) int {
 	// 키 입력으로 읽어 이 통지가 생기지 않는다 — 그래서 명령 실행 중에만 보였다.)
 	signal.Notify(make(chan os.Signal, 1), os.Interrupt)
 
-	if err := enableConsoleUTF8(); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "enable UTF-8 console: %v\n", err)
-		return 1
+	// 콘솔 코드 페이지는 --utf8-console 을 받았을 때만 65001(UTF-8)로 바꾼다. 러너가 PowerShell 7 에만
+	// 붙인다(이유는 localsession 의 wrapperCommandArgs). 그 밖의 셸은 시스템 기본(한국어 Windows 는
+	// 949)으로 뜬다 — 일반 PowerShell 창과 같은 상태다.
+	//
+	// 예전에는 SSM(aws CLI) 출력의 한글 때문에 늘 바꿨다. 그 경로가 없어진 뒤로는 로컬 셸만 이 래퍼를
+	// 거친다.
+	if config.utf8Console {
+		if err := enableConsoleUTF8(); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "enable UTF-8 console: %v\n", err)
+			return 1
+		}
 	}
 
 	consoleInput, closeInput, err := openConsoleFile(
@@ -164,9 +174,12 @@ func parseArgs(args []string) (wrapperConfig, error) {
 		case "--control-pipe":
 			index++
 			if index >= len(args) || args[index] == "" {
-				return wrapperConfig{}, fmt.Errorf("usage: aws-conpty-wrapper [--control-pipe <pipe>] <command> [args...]")
+				return wrapperConfig{}, fmt.Errorf("usage: aws-conpty-wrapper [--control-pipe <pipe>] [--utf8-console] <command> [args...]")
 			}
 			config.controlPipePath = args[index]
+			index++
+		case "--utf8-console":
+			config.utf8Console = true
 			index++
 		default:
 			config.command = append([]string(nil), args[index:]...)
@@ -175,7 +188,7 @@ func parseArgs(args []string) (wrapperConfig, error) {
 	}
 
 	if len(config.command) == 0 {
-		return wrapperConfig{}, fmt.Errorf("usage: aws-conpty-wrapper [--control-pipe <pipe>] <command> [args...]")
+		return wrapperConfig{}, fmt.Errorf("usage: aws-conpty-wrapper [--control-pipe <pipe>] [--utf8-console] <command> [args...]")
 	}
 
 	return config, nil

@@ -7,9 +7,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/windows"
 
 	"dolssh/services/ssh-core/internal/protocol"
 )
@@ -272,6 +276,106 @@ func TestLocalPowerShellSurvivesCtrlCDuringCommand(t *testing.T) {
 		t.Fatalf("입력을 쓰지 못했다: %v", err)
 	}
 	waitForOutputContainsWithin(t, captured, "still-alive", 20*time.Second, waitResult, waitErr)
+}
+
+// Windows PowerShell 5.1 은 시스템 기본(OEM) 코드 페이지로 떠야 한다.
+//
+// 예전 래퍼는 모든 셸을 65001(UTF-8)로 띄웠다. 그 상태에서 5.1 은 표의 각 줄을 폭까지 공백으로
+// 채우면서 한글을 1칸으로 세어, `오전/오후` 가 든 `ls` 의 줄마다 1칸이 넘쳐 항목 사이에 빈 줄이
+// 생겼다(창 폭이 바뀔 때마다 접혔다 펴지기도 했다). 기본 코드 페이지에서는 그러지 않는다.
+//
+// PowerShell 7 이 깔린 기기에서도 5.1 을 골라 띄운다 — 기본 순서대로 고르면 7 이 먼저 잡힌다.
+func TestLocalWindowsPowerShellKeepsSystemConsoleCodePage(t *testing.T) {
+	output, input := consoleCodePagesSeenByShell(t, resolveWindowsShellOfKind(t, windowsShellKindPowerShell))
+	if want := systemOEMCodePage(t); output != want || input != want {
+		t.Errorf("Windows PowerShell 이 본 콘솔 코드 페이지가 출력 %d·입력 %d 다 — 시스템 기본 %d 여야 한다", output, input, want)
+	}
+}
+
+// PowerShell 7 은 UTF-8(65001)로 뜬다. 외부 프로그램(git 등)이 UTF-8 로 낸 출력을 변수로 받아도 한글이
+// 깨지지 않고, 7 은 65001 에서도 표가 멀쩡하다. 7 이 없는 기기에서는 건너뛴다.
+func TestLocalPwshUsesUTF8ConsoleCodePage(t *testing.T) {
+	output, input := consoleCodePagesSeenByShell(t, resolveWindowsShellOfKind(t, windowsShellKindPwsh))
+	if output != 65001 || input != 65001 {
+		t.Errorf("PowerShell 7 이 본 콘솔 코드 페이지가 출력 %d·입력 %d 다 — 둘 다 65001 이어야 한다", output, input)
+	}
+}
+
+// consoleCodePagesSeenByShell 은 셸을 프로덕션과 같은 래퍼로 띄워 셸이 보는 콘솔 출력·입력 코드
+// 페이지를 읽는다.
+func consoleCodePagesSeenByShell(t *testing.T, shellRuntime windowsShellRuntime) (output int, input int) {
+	t.Helper()
+	args, preinstalled := withShellIntegrationArgs(shellRuntime.kind, shellRuntime.args)
+
+	runner, err := startPlatformLocalRunner(protocol.LocalConnectPayload{Cols: 120, Rows: 30}, localCommandRuntime{
+		shellKind:                    shellRuntime.kind,
+		executablePath:               shellRuntime.executablePath,
+		args:                         args,
+		env:                          append(os.Environ(), "APPDATA="+seedPSReadLineHistory(t, shellRuntime.kind, 0)),
+		wrapperPath:                  buildConPTYWrapperBinary(t),
+		workingDirectory:             t.TempDir(),
+		shellIntegrationPreinstalled: preinstalled,
+	})
+	if err != nil {
+		t.Fatalf("로컬 셸을 띄우지 못했다: %v", err)
+	}
+	defer func() {
+		_ = runner.Kill()
+		_ = runner.Close()
+	}()
+
+	captured := &capturedOutput{}
+	for _, stream := range runner.Streams() {
+		go copyReaderOutput(captured, stream)
+	}
+	if !waitFor(t, 30*time.Second, func() bool {
+		return strings.Contains(captured.snapshot(), "\x1b]133;B\x07")
+	}) {
+		t.Fatalf("첫 프롬프트 마커가 오지 않았다: %q", visibleMarkers(captured.snapshot()))
+	}
+
+	// 출력을 이어 붙여 만들어 입력 줄의 에코("'codepage-' + …")와 구분한다.
+	probe := "Write-Output ('codepage-' + [Console]::OutputEncoding.CodePage + '-' + [Console]::InputEncoding.CodePage)\r"
+	if err := runner.Write([]byte(probe)); err != nil {
+		t.Fatalf("입력을 쓰지 못했다: %v", err)
+	}
+	reported := regexp.MustCompile(`codepage-(\d+)-(\d+)`)
+	var match []string
+	if !waitFor(t, 20*time.Second, func() bool {
+		match = reported.FindStringSubmatch(captured.snapshot())
+		return match != nil
+	}) {
+		t.Fatalf("코드 페이지를 읽지 못했다: %q", visibleMarkers(captured.snapshot()))
+	}
+	output, _ = strconv.Atoi(match[1])
+	input, _ = strconv.Atoi(match[2])
+	return output, input
+}
+
+// resolveWindowsShellOfKind 는 그 종류의 셸만 후보로 놓고 찾는다. 없으면 테스트를 건너뛴다.
+func resolveWindowsShellOfKind(t *testing.T, kind string) windowsShellRuntime {
+	t.Helper()
+	var candidates []windowsShellCandidate
+	for _, candidate := range buildWindowsShellCandidates() {
+		if candidate.kind == kind {
+			candidates = append(candidates, candidate)
+		}
+	}
+	shellRuntime, err := resolveWindowsShellRuntimeWithLookup(candidates, isWindowsShellUsable)
+	if err != nil {
+		t.Skipf("%s 셸이 없다: %v", kind, err)
+	}
+	return shellRuntime
+}
+
+// systemOEMCodePage 는 새 콘솔이 기본으로 쓰는 코드 페이지다(한국어 Windows 는 949).
+func systemOEMCodePage(t *testing.T) int {
+	t.Helper()
+	codePage, _, _ := windows.NewLazySystemDLL("kernel32.dll").NewProc("GetOEMCP").Call()
+	if codePage == 0 {
+		t.Fatal("GetOEMCP 가 실패했다")
+	}
+	return int(codePage)
 }
 
 // seedPSReadLineHistory 는 PSReadLine 이 기동 시 읽을 히스토리 파일을 심고 그 APPDATA 를 준다.
