@@ -138,6 +138,20 @@ describe('terminal autocomplete', () => {
     expect(results).not.toContain('npm run broken');
   });
 
+  // Ctrl+C 로 끝내는 게 정상인 명령(tail -f, 개발 서버)이 한 번 끊었다고 제안에서 사라지면 안 된다.
+  it('keeps commands that were interrupted with Ctrl+C (130) or SIGPIPE (141)', () => {
+    const s = snap(['npm run dev', 'npm run logs']);
+    const sessionStats = new Map<string, SessionCommandStat>([
+      ['npm run dev', { count: 1, lastSeq: 2, lastExit: 130 }],
+      ['npm run logs', { count: 1, lastSeq: 1, lastExit: 141 }],
+    ]);
+    const results = getTerminalAutocompleteSuggestions(s, cmd('npm run'), {
+      sessionStats,
+    }).map((entry) => entry.insertText);
+    expect(results).toContain('npm run dev');
+    expect(results).toContain('npm run logs');
+  });
+
   it('completes full command lines from history (no history-derived "Option" source)', () => {
     const s = snap(['git status -s', 'git commit -m wip', 'git status']);
     const results = getTerminalAutocompleteSuggestions(s, cmd('git s'));

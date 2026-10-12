@@ -16,12 +16,13 @@
 import { Terminal } from '@xterm/headless';
 import type { IMarker } from '@xterm/headless';
 import type { SessionReplayRecording } from '@shared';
+import { classifyCommandExit } from '@shared';
 import {
   readCommandTextFromBuffer,
   unescapeReportedCommand,
 } from './terminal-command-blocks';
 
-export type ReplayCommandState = 'ok' | 'failed' | 'running';
+export type ReplayCommandState = 'ok' | 'interrupted' | 'failed' | 'running';
 
 export interface ReplayCommandBlock {
   /** 녹화 내 증가 시퀀스. */
@@ -199,7 +200,7 @@ export async function scanReplayCommands(
           block.endAtMs = currentAtMs;
           block.durationMs = Math.max(0, currentAtMs - block.atMs);
           block.exitCode = exitCode;
-          block.state = exitCode === null || exitCode === 0 ? 'ok' : 'failed';
+          block.state = classifyCommandExit(exitCode);
           break;
         }
         return true;

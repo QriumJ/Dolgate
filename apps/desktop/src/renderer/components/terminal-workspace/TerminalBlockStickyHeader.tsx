@@ -5,6 +5,7 @@
 import type { TerminalBlockStickyState } from '../../controllers/useTerminalBlockOverlay';
 import { cn } from '../../lib/cn';
 import { formatBlockDuration } from './blockFormat';
+import { formatCommandExitLabel } from '@shared';
 import { useTranslation } from 'react-i18next';
 
 interface TerminalBlockStickyHeaderProps {
@@ -19,6 +20,8 @@ export function TerminalBlockStickyHeader({
   const { t: translate } = useTranslation();
   const failed = sticky.state === 'failed';
   const running = sticky.state === 'running';
+  // Ctrl+C·SIGPIPE 로 끝난 명령 — 실패 색을 쓰지 않고 라벨만 남긴다(블록 오버레이와 같다).
+  const interrupted = sticky.state === 'interrupted';
   const duration = formatBlockDuration(sticky.durationMs);
 
   return (
@@ -38,16 +41,23 @@ export function TerminalBlockStickyHeader({
             ? 'bg-[#ef6f6c]'
             : running
               ? 'bg-[#7aa2ff]'
-              : 'bg-[rgba(122,200,160,0.7)]',
+              : interrupted
+                ? 'bg-[rgba(160,174,192,0.75)]'
+                : 'bg-[rgba(122,200,160,0.7)]',
         )}
         aria-hidden="true"
       />
       <span className="min-w-0 flex-1 truncate font-mono text-[0.72rem] text-[rgba(232,239,255,0.92)]">
         {sticky.command ?? translate('stickyHeader.unreadable')}
       </span>
-      {failed && sticky.exitCode !== null ? (
-        <span className="shrink-0 text-[0.68rem] font-semibold text-[#ffb1b1]">
-          exit {sticky.exitCode}
+      {(failed || interrupted) && sticky.exitCode !== null ? (
+        <span
+          className={cn(
+            'shrink-0 text-[0.68rem] font-semibold',
+            failed ? 'text-[#ffb1b1]' : 'text-[rgba(226,234,255,0.7)]',
+          )}
+        >
+          {formatCommandExitLabel(sticky.exitCode)}
         </span>
       ) : null}
       {duration ? (

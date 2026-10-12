@@ -54,6 +54,23 @@ describe('scanReplayCommands', () => {
     expect(second.durationMs).toBe(400);
   });
 
+  // 녹화에는 종료코드 숫자만 남고 판정은 볼 때 한다 — 예전 녹화도 새 기준으로 보인다.
+  it('Ctrl+C 로 끊은 명령(130)은 실패가 아니라 interrupted 로 뽑는다', async () => {
+    const result = await scanReplayCommands(
+      recordingOf([
+        output(0, 'user@host:~$ \x1b]133;B\x07'),
+        output(100, 'tail -f syslog\r\n\x1b]133;C\x07'),
+        output(150, 'Oct 12 14:02:11 prod CRON[8830]: (root) CMD (sync)\r\n'),
+        output(2_000, '^C\r\n\x1b]133;D;130\x07'),
+      ]),
+    );
+
+    const [block] = result.blocks;
+    expect(block.command).toBe('tail -f syslog');
+    expect(block.exitCode).toBe(130);
+    expect(block.state).toBe('interrupted');
+  });
+
   it('OSC 7 로 보고된 작업 디렉터리를 블록에 붙인다', async () => {
     const result = await scanReplayCommands(
       recordingOf([

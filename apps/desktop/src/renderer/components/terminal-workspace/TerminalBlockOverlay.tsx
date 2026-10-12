@@ -9,6 +9,7 @@ import { BLOCK_TOOLBAR_ATTRIBUTE } from '../../controllers/useTerminalBlockOverl
 import type { TerminalBlockOverlayState } from '../../controllers/useTerminalBlockOverlay';
 import { cn } from '../../lib/cn';
 import { formatBlockDuration } from './blockFormat';
+import { formatCommandExitLabel } from '@shared';
 import { Check, ClipboardList, Copy, Play, Sparkles } from '../../ui/icons';
 import { Tooltip } from '../../ui';
 import { useTranslation } from 'react-i18next';
@@ -43,6 +44,13 @@ export function TerminalBlockOverlay({
   const { t: translate } = useTranslation();
   const running = overlay.state === 'running';
   const failed = overlay.state === 'failed';
+  // Ctrl+C(130)·SIGPIPE(141)로 끝난 명령. 실패가 아니라 성공과 같은 무게로 그리고, 무엇으로
+  // 끝났는지만 라벨(`^C`)로 남긴다 — 빨강은 진짜 실패에만 쓴다.
+  const interrupted = overlay.state === 'interrupted';
+  const exitLabel =
+    (failed || interrupted) && overlay.exitCode !== null
+      ? formatCommandExitLabel(overlay.exitCode)
+      : null;
   const duration = formatBlockDuration(overlay.durationMs);
   const TOOLBAR_BASE_TOP_PX = 4;
   const TOOLBAR_HEIGHT_PX = 22;
@@ -71,7 +79,9 @@ export function TerminalBlockOverlay({
             ? 'border-l-[#ef6f6c] bg-[rgba(239,111,108,0.06)]'
             : running
               ? 'border-l-[#7aa2ff] bg-[rgba(122,162,255,0.06)]'
-              : 'border-l-[rgba(122,200,160,0.5)] bg-[rgba(255,255,255,0.035)]',
+              : interrupted
+                ? 'border-l-[rgba(160,174,192,0.55)] bg-[rgba(255,255,255,0.035)]'
+                : 'border-l-[rgba(122,200,160,0.5)] bg-[rgba(255,255,255,0.035)]',
         )}
       />
 
@@ -83,15 +93,19 @@ export function TerminalBlockOverlay({
         style={{ top: toolbarTop }}
         {...{ [BLOCK_TOOLBAR_ATTRIBUTE]: 'true' }}
       >
-        {duration || failed ? (
+        {duration || exitLabel ? (
           <span
             className={cn(
               'border-r border-[rgba(255,255,255,0.1)] px-2 text-[0.7rem] font-semibold tabular-nums leading-[22px]',
-              failed ? 'text-[#ffb1b1]' : 'text-[rgba(232,239,255,0.95)]',
+              failed
+                ? 'text-[#ffb1b1]'
+                : interrupted
+                  ? 'text-[rgba(226,234,255,0.7)]'
+                  : 'text-[rgba(232,239,255,0.95)]',
             )}
           >
-            {failed && overlay.exitCode !== null
-              ? `exit ${overlay.exitCode}${duration ? ` · ${duration}` : ''}`
+            {exitLabel
+              ? `${exitLabel}${duration ? ` · ${duration}` : ''}`
               : duration}
           </span>
         ) : null}

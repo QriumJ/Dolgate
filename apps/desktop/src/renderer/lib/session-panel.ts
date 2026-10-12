@@ -47,7 +47,7 @@ export interface SessionPanelHistoryItem {
   command: string | null;
   /** 읽은 값이 실제 입력과 다를 수 있다(여러 줄·행 예산 초과). */
   commandUnreliable: boolean;
-  state: 'running' | 'ok' | 'failed';
+  state: 'running' | 'ok' | 'interrupted' | 'failed';
   exitCode: number | null;
   durationMs: number | null;
   cwd: string | null;

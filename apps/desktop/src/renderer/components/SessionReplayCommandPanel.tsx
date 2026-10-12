@@ -3,6 +3,7 @@
 
 import { memo } from 'react';
 import type { ReplayCommandBlock } from '../lib/replay-command-scan';
+import { formatCommandExitCode } from '@shared';
 import { cn } from '../lib/cn';
 import { useTranslation } from "react-i18next";
 
@@ -125,16 +126,27 @@ function SessionReplayCommandPanelImpl({
                       ? 'bg-[var(--danger-text)]'
                       : block.state === 'running'
                         ? 'bg-[var(--accent-strong)]'
-                        : 'bg-[color-mix(in_srgb,var(--success-text)_70%,transparent_30%)]',
+                        : block.state === 'interrupted'
+                          ? 'bg-[color-mix(in_srgb,var(--text-soft)_70%,transparent_30%)]'
+                          : 'bg-[color-mix(in_srgb,var(--success-text)_70%,transparent_30%)]',
                   )}
                   aria-hidden="true"
                 />
                 <span className="min-w-0 flex-1 truncate font-mono text-[0.78rem] text-[var(--text)]">
                   {block.command ?? translate('replayCommands.unreadable')}
                 </span>
-                {block.state === 'failed' && block.exitCode !== null ? (
-                  <span className="shrink-0 text-[0.68rem] font-semibold text-[var(--danger-text)]">
-                    {block.exitCode}
+                {(block.state === 'failed' || block.state === 'interrupted') &&
+                block.exitCode !== null ? (
+                  // Ctrl+C·SIGPIPE 로 끝난 명령은 실패 색 대신 회색 — 빨강은 진짜 실패에만.
+                  <span
+                    className={cn(
+                      'shrink-0 text-[0.68rem] font-semibold',
+                      block.state === 'failed'
+                        ? 'text-[var(--danger-text)]'
+                        : 'text-[var(--text-soft)]',
+                    )}
+                  >
+                    {formatCommandExitCode(block.exitCode)}
                   </span>
                 ) : null}
                 {duration ? (

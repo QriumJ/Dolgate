@@ -1,4 +1,5 @@
 import type { TerminalAutocompleteSnapshot } from './models';
+import { classifyCommandExit } from './command-exit';
 import { matchCommandSpec } from './command-spec/match';
 import type { CommandSpec } from './command-spec/types';
 
@@ -422,8 +423,10 @@ export function getTerminalAutocompleteSuggestions(
     .map(entry => entry.suggestion);
 }
 
+// 이 세션에서 마지막 실행이 실패한 명령은 제안에서 뺀다. Ctrl+C 로 끊은 것(130)은 실패가 아니다 —
+// `tail -f`·`top`·개발 서버처럼 끊는 게 정상인 명령이 한 번 끊고 나면 사라지면 안 된다.
 function isFailedSessionStat(stat: SessionCommandStat | undefined): boolean {
-  return Boolean(stat && stat.lastExit != null && stat.lastExit !== 0);
+  return Boolean(stat && classifyCommandExit(stat.lastExit) === 'failed');
 }
 
 function matchesCwd(

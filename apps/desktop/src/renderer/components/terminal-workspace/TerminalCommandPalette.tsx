@@ -6,6 +6,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { cn } from '../../lib/cn';
 import type { TerminalCommandBlockState } from '../../lib/terminal-command-blocks';
 import { formatBlockDuration, formatBlockRelativeTime } from './blockFormat';
+import { formatCommandExitLabel } from '@shared';
 import { useTranslation } from 'react-i18next';
 
 export interface TerminalCommandPaletteItem {
@@ -186,7 +187,9 @@ export function TerminalCommandPalette({
                         ? 'bg-[#ef6f6c]'
                         : item.state === 'running'
                           ? 'bg-[#7aa2ff]'
-                          : 'bg-[rgba(122,200,160,0.7)]',
+                          : item.state === 'interrupted'
+                            ? 'bg-[rgba(160,174,192,0.75)]'
+                            : 'bg-[rgba(122,200,160,0.7)]',
                     )}
                     aria-hidden="true"
                   />
@@ -216,6 +219,12 @@ export function TerminalCommandPalette({
                   {item.state === 'failed' && item.exitCode !== null ? (
                     <span className="shrink-0 rounded-full bg-[rgba(239,111,108,0.2)] px-1.5 py-0.5 text-[0.68rem] font-semibold text-[#ffb1b1]">
                       exit {item.exitCode}
+                    </span>
+                  ) : null}
+                  {/* Ctrl+C 로 끊은 명령은 딱지 없이 글자만 — 실패처럼 눈에 걸리면 안 된다. */}
+                  {item.state === 'interrupted' && item.exitCode !== null ? (
+                    <span className="shrink-0 text-[0.68rem] font-semibold text-[rgba(226,234,255,0.6)]">
+                      {formatCommandExitLabel(item.exitCode)}
                     </span>
                   ) : null}
                   {duration ? (

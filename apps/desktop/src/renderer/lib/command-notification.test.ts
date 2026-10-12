@@ -56,6 +56,17 @@ describe("shouldNotifyCommandFinished", () => {
     ).toBe(true);
   });
 
+  // 사용자가 직접 끊은 것(130)·pager 를 닫은 것(141)은 실패도 아니고, 오래 돌았어도 "끝났다" 고
+  // 알릴 일이 아니다 — 끊은 사람이 바로 그 화면 앞에 있었다.
+  it.each([130, 141])("%i 로 끝난 명령은 실패로도, 오래 걸린 명령으로도 알리지 않는다", (exitCode) => {
+    expect(
+      shouldNotifyCommandFinished(
+        { ...base, commandNotificationOnlyWhenUnfocused: false },
+        { command: "npm run dev", exitCode, durationMs: 600_000, visibleToUser: false },
+      ),
+    ).toBe(false);
+  });
+
   it("실패 알림 옵션이 꺼져 있으면 짧은 실패는 알리지 않는다", () => {
     expect(
       shouldNotifyCommandFinished(

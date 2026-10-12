@@ -16,7 +16,7 @@ function block(
     endAtMs: atMs + 10,
     durationMs: 10,
     command: `cmd-${id}`,
-    exitCode: state === 'failed' ? 1 : 0,
+    exitCode: state === 'failed' ? 1 : state === 'interrupted' ? 130 : 0,
     cwd: null,
     state,
   };
@@ -54,6 +54,17 @@ describe('buildScrubberMarkerClusters', () => {
     );
     expect(clusters).toHaveLength(1);
     expect(clusters[0].state).toBe('failed');
+  });
+
+  // Ctrl+C 로 끊은 명령은 실패가 아니다 — 눈금이 실패처럼 높이 솟으면 실패가 어디 몰렸는지 흐려진다.
+  it('Ctrl+C 로 끊은 명령만 묶이면 실패로 표시하지 않는다', () => {
+    const clusters = buildScrubberMarkerClusters(
+      [block(1, 0), block(2, 20, 'interrupted'), block(3, 40)],
+      10_000,
+      500,
+    );
+    expect(clusters).toHaveLength(1);
+    expect(clusters[0].state).not.toBe('failed');
   });
 
   it('트랙 폭이 넓어지면 묶였던 눈금이 갈라진다', () => {

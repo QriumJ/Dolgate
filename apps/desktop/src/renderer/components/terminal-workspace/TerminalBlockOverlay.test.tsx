@@ -77,4 +77,11 @@ describe('TerminalBlockOverlay', () => {
     renderOverlay({ overlay: overlayState({ state: 'failed', exitCode: 1 }) });
     expect(screen.getByText('exit 1 · 41ms')).toBeTruthy();
   });
+
+  // Ctrl+C 로 끊은 명령은 실패 색(빨강)을 쓰지 않고 터미널이 찍는 표기 그대로 `^C` 라고만 적는다.
+  it('Ctrl+C 로 끊은 명령은 ^C 로 적고 실패 색을 쓰지 않는다', () => {
+    renderOverlay({ overlay: overlayState({ state: 'interrupted', exitCode: 130 }) });
+    const label = screen.getByText('^C · 41ms');
+    expect(label.className).not.toContain('#ffb1b1');
+  });
 });

@@ -8,8 +8,13 @@
 // 명령마다 전역 리렌더를 유발할 이유가 없다.
 
 import type { IDecoration, IMarker, Terminal } from '@xterm/xterm';
+import { classifyCommandExit } from '@shared';
 
-export type TerminalCommandBlockState = 'running' | 'ok' | 'failed';
+/**
+ * interrupted 는 Ctrl+C(130)·SIGPIPE(141)로 끝난 명령이다 — 0 이 아니어도 실패로 치지 않는다
+ * (판정은 shared-core classifyCommandExit 한 곳).
+ */
+export type TerminalCommandBlockState = 'running' | 'ok' | 'interrupted' | 'failed';
 
 export interface TerminalCommandBlock {
   /** 세션 내 증가 시퀀스(표시·정렬용). */
@@ -95,6 +100,8 @@ const ACCENT_COLORS: Record<TerminalCommandBlockState, string> = {
   running: '#7aa2ff',
   // 성공은 화면이 시끄러워지지 않도록 낮은 채도로 잔잔하게.
   ok: 'rgba(122, 200, 160, 0.45)',
+  // Ctrl+C·SIGPIPE 로 끝난 명령 — 실패가 아니므로 성공과 같은 무게의 회색.
+  interrupted: 'rgba(160, 174, 192, 0.55)',
   failed: '#ef6f6c',
 };
 
@@ -654,7 +661,7 @@ function closeRunningBlock(
     if (block.state !== 'running') {
       continue;
     }
-    block.state = exitCode === null || exitCode === 0 ? 'ok' : 'failed';
+    block.state = classifyCommandExit(exitCode);
     block.exitCode = exitCode;
     block.durationMs = Date.now() - block.startedAt;
     // endLine 은 **이 블록에 속하는 마지막 행**이다(포함). D 마커가 올 때 커서는 보통 출력 뒤의

@@ -8,6 +8,7 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import type { RefObject } from 'react';
 import type { ReplayCommandBlock } from '../lib/replay-command-scan';
+import { formatCommandExitLabel } from '@shared';
 import { useTranslation } from 'react-i18next';
 
 interface SessionReplayScrubberMarkersProps {
@@ -41,6 +42,7 @@ function rootFontSizePx(): number {
 
 /**
  * 실패 > 실행 중 > 성공 순으로 클러스터 색을 정한다 — 묶였을 때 실패가 묻히면 안 된다.
+ * Ctrl+C·SIGPIPE 로 끝난 명령(interrupted)은 실패가 아니라 성공과 같은 눈금이다.
  */
 function mergeState(
   current: ReplayCommandBlock['state'],
@@ -211,9 +213,16 @@ function SessionReplayScrubberMarkersImpl({
             <span className="font-mono">
               {hover.block.command ?? translate('misc.commandUnreadable')}
             </span>
-            {hover.block.state === 'failed' && hover.block.exitCode !== null ? (
-              <span className="ml-1 font-semibold text-[var(--danger-text)]">
-                exit {hover.block.exitCode}
+            {(hover.block.state === 'failed' || hover.block.state === 'interrupted') &&
+            hover.block.exitCode !== null ? (
+              <span
+                className={
+                  hover.block.state === 'failed'
+                    ? 'ml-1 font-semibold text-[var(--danger-text)]'
+                    : 'ml-1 font-semibold text-[var(--text-soft)]'
+                }
+              >
+                {formatCommandExitLabel(hover.block.exitCode)}
               </span>
             ) : null}
           </div>

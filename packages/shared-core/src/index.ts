@@ -2,6 +2,7 @@ export * from "./account-password";
 export * from "./api";
 export * from "./base64";
 export * from "./client-api";
+export * from "./command-exit";
 export * from "./connection-failure";
 export * from "./credential-retry";
 export * from "./aws-ssm-attempt";

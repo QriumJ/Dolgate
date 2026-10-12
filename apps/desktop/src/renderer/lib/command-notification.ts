@@ -1,4 +1,5 @@
 import type { CommandNotificationSettings } from '@shared';
+import { classifyCommandExit } from '@shared';
 import { t } from '../i18n';
 
 /** OSC 133 C→D 경계에서 관측한, 방금 끝난 명령의 정보. */
@@ -20,7 +21,7 @@ export interface CommandNotificationDecisionInput extends CommandFinishedInfo {
 }
 
 function isFailure(exitCode: number | null): boolean {
-  return exitCode !== null && exitCode !== 0;
+  return classifyCommandExit(exitCode) === 'failed';
 }
 
 /**
@@ -36,6 +37,11 @@ export function shouldNotifyCommandFinished(
   }
   // 사용자가 해당 출력을 지금 보고 있으면(앱 포커스 + 활성 탭) 알리지 않는다.
   if (settings.commandNotificationOnlyWhenUnfocused && input.visibleToUser) {
+    return false;
+  }
+  // Ctrl+C 로 끊었거나(130) pager 를 닫은(141) 명령은 사용자가 직접 끝낸 것이다 — 오래 걸렸어도
+  // "끝났다" 고 알릴 일이 아니다.
+  if (classifyCommandExit(input.exitCode) === 'interrupted') {
     return false;
   }
   // 실패는 시간과 무관하게 알린다(옵션이 켜진 경우).

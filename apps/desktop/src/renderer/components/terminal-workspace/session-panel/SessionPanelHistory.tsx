@@ -3,6 +3,7 @@
 
 import { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
+import { formatCommandExitLabel } from '@shared';
 import { cn } from '../../../lib/cn';
 import {
   buildHistoryItems,
@@ -116,6 +117,11 @@ export function SessionPanelHistory({
             const actions = resolveHistoryActions(item, sender.context);
             const command = item.command ?? '';
             const failed = item.state === 'failed' && item.exitCode !== null;
+            // Ctrl+C·SIGPIPE 로 끝난 명령은 딱지 없이 시각·소요와 같은 회색 글자로만 둔다.
+            const interruptedLabel =
+              item.state === 'interrupted' && item.exitCode !== null
+                ? formatCommandExitLabel(item.exitCode)
+                : null;
             // 시각·소요는 오른쪽에 모아 줄마다 같은 자리에 오게 한다. 작업 디렉터리는 길이가
             // 제각각이라 왼쪽에서 잘리는 쪽이 낫다.
             const running = item.state === 'running';
@@ -137,6 +143,9 @@ export function SessionPanelHistory({
                       <span className="mr-1.5 rounded-[4px] bg-[var(--danger-bg)] px-1 py-px text-[0.64rem] font-medium text-[var(--danger-text)]">
                         exit {item.exitCode}
                       </span>
+                    ) : null}
+                    {interruptedLabel ? (
+                      <span className="mr-1.5">{interruptedLabel}</span>
                     ) : null}
                     {/* 실행 중은 색으로 말한다 — 시각·소요와 같은 회색이면 훑을 때 안 걸린다. */}
                     {running ? (

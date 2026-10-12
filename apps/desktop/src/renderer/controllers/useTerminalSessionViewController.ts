@@ -11,6 +11,7 @@ import type {
   SessionShareSnapshotInput,
   TerminalTab,
 } from '@shared';
+import { classifyCommandExit } from '@shared';
 import type { Terminal } from '@xterm/xterm';
 import {
   createTerminalRuntime,
@@ -1124,7 +1125,10 @@ export function useTerminalSessionViewController({
               .getState()
               .applyTabCommandState(
                 liveSessionIdRef.current,
-                exitCode === 0 ? 'ok' : 'failed',
+                // Ctrl+C 로 끊은 명령(130)은 실패가 아니다 — 탭 점을 빨갛게 하지 않는다. 셸
+                // 통합은 프롬프트마다 직전 $? 를 보내므로, bash 에서는 명령 없이 프롬프트에서
+                // Ctrl+C 만 눌러도 130 이 온다.
+                classifyCommandExit(exitCode) === 'failed' ? 'failed' : 'ok',
               );
             setSessionLastCommandAt(liveSessionIdRef.current);
           }

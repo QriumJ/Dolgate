@@ -294,6 +294,33 @@ describe('terminal-command-blocks', () => {
     expect(dot()?.style.backgroundColor).not.toBe(runningColor);
   });
 
+  // Ctrl+C 로 끊은 명령(130)·pager 를 닫은 명령(141)은 실패가 아니다 — 빨간 점을 찍으면
+  // `tail -f`·`top` 처럼 끊는 게 정상인 명령이 매번 실패처럼 보인다.
+  it.each([130, 141])('%i 로 끝난 명령은 interrupted 로, 실패와 다른 색으로 표시한다', (code) => {
+    const failedFake = createFakeTerminal(['$ boom']);
+    failedFake.buffer.cursorX = 2;
+    notePromptCommandStart('failed-session', failedFake.terminal);
+    failedFake.buffer.cursorY = 1;
+    beginCommandBlock('failed-session', failedFake.terminal, null);
+    finishCommandBlock('failed-session', failedFake.terminal, 1);
+    const failedColor = (failedFake.decorations[0].element?.firstElementChild as HTMLElement)
+      .style.backgroundColor;
+
+    const fake = createFakeTerminal(['$ tail -f syslog']);
+    fake.buffer.cursorX = 2;
+    notePromptCommandStart(SESSION, fake.terminal);
+    fake.buffer.cursorY = 1;
+    beginCommandBlock(SESSION, fake.terminal, null);
+    finishCommandBlock(SESSION, fake.terminal, code);
+
+    const [block] = getCommandBlocks(SESSION);
+    expect(block.state).toBe('interrupted');
+    expect(block.exitCode).toBe(code);
+    const dot = fake.decorations[0].element?.firstElementChild as HTMLElement;
+    expect(dot.style.backgroundColor).not.toBe(failedColor);
+    clearCommandBlocks('failed-session');
+  });
+
   it('점 마커는 명령 줄 한 행에만 찍고, 출력 끝 행은 기록만 해 둔다', () => {
     const fake = createFakeTerminal(['$ build']);
     fake.buffer.cursorX = 2;
@@ -408,8 +435,8 @@ describe('terminal-command-blocks', () => {
 
   it('failedOnly 점프는 실패한 명령만 건너뛴다', () => {
     const fake = createFakeTerminal([]);
-    // 10=성공, 20=실패, 30=성공, 40=실패
-    const exitCodes = [0, 1, 0, 1];
+    // 10=성공, 20=실패, 30=Ctrl+C 로 끊음(실패 아님), 40=실패
+    const exitCodes = [0, 1, 130, 1];
     [10, 20, 30, 40].forEach((line, index) => {
       fake.buffer.cursorY = line;
       notePromptCommandStart(SESSION, fake.terminal);
@@ -422,7 +449,7 @@ describe('terminal-command-blocks', () => {
     expect(
       jumpToAdjacentCommandBlock(SESSION, fake.terminal, 'next', { failedOnly: true }),
     ).toBe(true);
-    // 30(성공)을 건너뛰고 40(실패)으로 간다.
+    // 30(Ctrl+C)을 건너뛰고 40(실패)으로 간다.
     expect(fake.scrolledTo.at(-1)).toBe(40);
 
     expect(
