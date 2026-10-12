@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -61,6 +62,15 @@ func run(args []string) int {
 		_, _ = fmt.Fprintln(os.Stderr, err.Error())
 		return 2
 	}
+
+	// Ctrl+C 는 받아서 버린다 — 등록만 하고 읽지 않는다.
+	//
+	// 콘솔의 Ctrl+C 는 그 콘솔에 붙은 프로세스 **전부**에 간다. 셸만이 아니라 셸을 띄운 이 래퍼도
+	// 받는다. Go 는 받을 곳이 없는 Ctrl+C 를 Windows 기본 처리(프로세스 종료)로 넘기므로, 명령
+	// 실행 중에 Ctrl+C 를 누르면 래퍼가 죽고 아래 job object 가 셸까지 정리해 탭이 닫혔다.
+	// 명령을 멈추는 일은 셸과 그 명령이 각자 한다. (빈 프롬프트에서는 PSReadLine 이 Ctrl+C 를
+	// 키 입력으로 읽어 이 통지가 생기지 않는다 — 그래서 명령 실행 중에만 보였다.)
+	signal.Notify(make(chan os.Signal, 1), os.Interrupt)
 
 	if err := enableConsoleUTF8(); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "enable UTF-8 console: %v\n", err)

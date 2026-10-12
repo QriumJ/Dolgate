@@ -189,6 +189,91 @@ func TestLocalPowerShellReportsFailingExitCode(t *testing.T) {
 	}
 }
 
+// 명령 실행 중에 누른 Ctrl+C 는 그 명령만 멈춰야 한다. 세션까지 끝나면 탭이 닫힌다.
+//
+// 콘솔의 Ctrl+C 는 콘솔에 붙은 프로세스 전부에 가서 셸을 띄운 래퍼도 받는다. 래퍼가 받을 곳을
+// 등록하지 않으면 Windows 기본 처리로 종료되고 job object 가 셸까지 정리한다 — 실기기에서
+// `Start-Sleep 30` 을 Ctrl+C 로 끊자 탭이 닫혔다. 빈 프롬프트에서는 PSReadLine 이 Ctrl+C 를
+// 키로 읽어 통지가 생기지 않으므로, 명령이 도는 중에 보내야 재현된다.
+func TestLocalPowerShellSurvivesCtrlCDuringCommand(t *testing.T) {
+	shellRuntime, err := resolveWindowsShellRuntime()
+	if err != nil {
+		t.Skipf("사용할 수 있는 Windows 셸이 없다: %v", err)
+	}
+	if shellRuntime.kind != windowsShellKindPwsh && shellRuntime.kind != windowsShellKindPowerShell {
+		t.Skipf("PowerShell 이 아니다(kind=%s)", shellRuntime.kind)
+	}
+	args, preinstalled := withShellIntegrationArgs(shellRuntime.kind, shellRuntime.args)
+
+	runner, err := startPlatformLocalRunner(protocol.LocalConnectPayload{Cols: 120, Rows: 30}, localCommandRuntime{
+		shellKind:                    shellRuntime.kind,
+		executablePath:               shellRuntime.executablePath,
+		args:                         args,
+		env:                          append(os.Environ(), "APPDATA="+seedPSReadLineHistory(t, shellRuntime.kind, 0)),
+		wrapperPath:                  buildConPTYWrapperBinary(t),
+		workingDirectory:             t.TempDir(),
+		shellIntegrationPreinstalled: preinstalled,
+	})
+	if err != nil {
+		t.Fatalf("로컬 셸을 띄우지 못했다: %v", err)
+	}
+	defer func() {
+		_ = runner.Kill()
+		_ = runner.Close()
+	}()
+
+	captured := &capturedOutput{}
+	for _, stream := range runner.Streams() {
+		go copyReaderOutput(captured, stream)
+	}
+	waitResult := make(chan sessionExit, 1)
+	waitErr := make(chan error, 1)
+	go func() {
+		exit, err := runner.Wait()
+		if err != nil {
+			waitErr <- err
+			return
+		}
+		waitResult <- exit
+	}()
+
+	waitForOutputContainsWithin(t, captured, "\x1b]133;B\x07", promptStartupTimeout, waitResult, waitErr)
+	if err := runner.Write([]byte("Start-Sleep -Seconds 30\r")); err != nil {
+		t.Fatalf("입력을 쓰지 못했다: %v", err)
+	}
+	// C 는 PSReadLine 이 줄을 넘긴 뒤에 나온다. 그때부터 Ctrl+C 는 키가 아니라 통지로 간다.
+	waitForOutputContainsWithin(t, captured, "\x1b]133;C\x07", 20*time.Second, waitResult, waitErr)
+	time.Sleep(time.Second)
+
+	interrupted := captured.snapshot()
+	if err := runner.Write([]byte{0x03}); err != nil {
+		t.Fatalf("Ctrl+C 를 쓰지 못했다: %v", err)
+	}
+	// 명령이 멈추고 다음 프롬프트(B)가 와야 한다. 그 사이 세션이 끝나면 탭이 닫히는 그 버그다.
+	deadline := time.Now().Add(20 * time.Second)
+	for !strings.Contains(captured.snapshot()[len(interrupted):], "\x1b]133;B\x07") {
+		select {
+		case exit := <-waitResult:
+			t.Fatalf("Ctrl+C 에 세션이 끝났다(%#v) — 탭이 닫힌다: %q", exit, visibleMarkers(captured.snapshot()[len(interrupted):]))
+		case err := <-waitErr:
+			t.Fatalf("Ctrl+C 뒤 세션이 오류로 끝났다: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Ctrl+C 뒤 프롬프트로 돌아오지 않았다: %q", visibleMarkers(captured.snapshot()[len(interrupted):]))
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// 끊긴 명령이 어떤 종료 코드로 보고되는지 남긴다(-v 로 본다). 앱은 이 값으로 실패와 중단을 가른다.
+	t.Logf("Ctrl+C 로 끊은 Start-Sleep 뒤 마커: %q", visibleMarkers(captured.snapshot()[len(interrupted):]))
+
+	// 셸이 살아서 다음 명령을 받는다. 출력을 이어 붙여 만들어 입력 줄의 에코와 구분한다.
+	if err := runner.Write([]byte("Write-Output ('still-' + 'alive')\r")); err != nil {
+		t.Fatalf("입력을 쓰지 못했다: %v", err)
+	}
+	waitForOutputContainsWithin(t, captured, "still-alive", 20*time.Second, waitResult, waitErr)
+}
+
 // seedPSReadLineHistory 는 PSReadLine 이 기동 시 읽을 히스토리 파일을 심고 그 APPDATA 를 준다.
 // Windows PowerShell 과 pwsh 는 저장 경로의 셸 이름이 다르므로 둘 다 심는다.
 func seedPSReadLineHistory(t *testing.T, shellKind string, lines int) string {
