@@ -15,6 +15,7 @@ import {
   noteInsertedCommand,
   notePromptCommandStart,
   noteReportedCommand,
+  noteScreenErased,
   readBlockOutput,
   realignCommandBlocks,
   unescapeReportedCommand,
@@ -1081,6 +1082,307 @@ describe('ConPTY 가 다시 그린 뒤 블록 위치 맞추기', () => {
       realigner.dispose();
     } finally {
       vi.useRealTimers();
+    }
+  });
+});
+
+// Ctrl+L 은 보이는 화면만 지우고(ESC[2J) 맨 위에 프롬프트를 다시 그린다. 출력이 화면보다 길었던
+// 블록은 명령 줄이 스크롤백에 남아 마커가 살아 있으므로, 끝을 당기지 않으면 지워진 화면 전체를
+// 자기 범위로 잡는다 — 빈 화면에 마우스를 올리면 그 블록 강조와 툴바가 떴다.
+describe('화면 전체 지우기 뒤 블록 범위', () => {
+  const PROMPT = 'PS> ';
+
+  /** promptLine 의 명령을 B→C 로 시작하고, outputEnd 행 첫 칸에서 D 를 받아 그 위 행에서 끝낸다. */
+  function recordCommand(
+    fake: ReturnType<typeof createFakeTerminal>,
+    promptLine: number,
+    outputEnd: number | null,
+  ) {
+    fake.buffer.cursorY = promptLine;
+    fake.buffer.cursorX = PROMPT.length;
+    notePromptCommandStart(SESSION, fake.terminal);
+    fake.buffer.cursorY = promptLine + 1;
+    fake.buffer.cursorX = 0;
+    beginCommandBlock(SESSION, fake.terminal, null);
+    if (outputEnd !== null) {
+      fake.buffer.cursorY = outputEnd;
+      finishCommandBlock(SESSION, fake.terminal, 0);
+    }
+  }
+
+  function setUp() {
+    // 0~3: 짧은 명령, 4~12: 화면보다 긴 출력, 13: 프롬프트. 화면(활성 영역)은 8행부터다.
+    const rows = [
+      `${PROMPT}pwd`,
+      'C:\\',
+      '',
+      '',
+      `${PROMPT}seq`,
+      ...Array.from({ length: 8 }, (_, index) => String(index + 1)),
+      PROMPT,
+    ];
+    const fake = createFakeTerminal(rows);
+    recordCommand(fake, 0, 4);
+    recordCommand(fake, 4, 13);
+    fake.buffer.baseY = 8;
+    fake.buffer.cursorY = 13 - 8;
+    return fake;
+  }
+
+  it('스크롤백에서 시작해 화면까지 이어진 블록은 지워지는 줄 바로 위에서 끝난다', () => {
+    const fake = setUp();
+    const [pwd, seq] = getCommandBlocks(SESSION);
+    expect(seq.endLine).toBe(12);
+    const versionBefore = getCommandBlocksVersion(SESSION);
+
+    noteScreenErased(SESSION, fake.terminal);
+
+    expect(seq.endLine).toBe(7);
+    // 스크롤백에 남은 출력은 그대로 그 블록 것이다.
+    expect(getCommandBlockAtLine(SESSION, 6)).toBe(seq);
+    for (let line = 8; line <= 13; line += 1) {
+      expect(getCommandBlockAtLine(SESSION, line)).toBeNull();
+    }
+    expect(readBlockOutput(SESSION, fake.terminal, seq)).toBe('1\n2\n3');
+    // 화면에 닿지 않던 블록은 그대로다.
+    expect(pwd.endLine).toBe(3);
+    expect(getCommandBlocksVersion(SESSION)).toBe(versionBefore + 1);
+  });
+
+  it('지울 블록이 없으면 알리지 않는다', () => {
+    const fake = setUp();
+    noteScreenErased(SESSION, fake.terminal);
+    const versionBefore = getCommandBlocksVersion(SESSION);
+
+    noteScreenErased(SESSION, fake.terminal);
+    expect(getCommandBlocksVersion(SESSION)).toBe(versionBefore);
+  });
+
+  it('실행 중인 블록은 건드리지 않는다 — 지운 뒤의 출력도 그 명령 것이다', () => {
+    const rows = [`${PROMPT}watch`, ...Array.from({ length: 10 }, (_, index) => String(index))];
+    const fake = createFakeTerminal(rows);
+    recordCommand(fake, 0, null);
+    fake.buffer.baseY = 5;
+    const [running] = getCommandBlocks(SESSION);
+
+    noteScreenErased(SESSION, fake.terminal);
+
+    expect(running.endLine).toBeNull();
+    expect(getCommandBlockAtLine(SESSION, 8)).toBe(running);
+  });
+
+  it('대체화면에서 지우는 것은 블록과 무관하다', () => {
+    const fake = setUp();
+    const seq = getCommandBlocks(SESSION)[1];
+    fake.buffer.type = 'alternate';
+
+    noteScreenErased(SESSION, fake.terminal);
+    expect(seq.endLine).toBe(12);
+  });
+});
+
+// PowerShell 의 `cls` 는 ESC[2J 없이 화면을 지운다(맨 위부터 줄마다 ESC[K, 그리고 ESC[3J). 줄마다 지우기는
+// 마커를 없애지 않으므로 `cls` 자신의 마커가 살아 있고, 끝날 때 커서는 맨 위다 — 빈 화면 아래쪽 원래
+// 명령 줄 자리에 `cls` 의 점이 남았다.
+describe('화면을 다시 쓰고 끝난 명령(cls)', () => {
+  const PROMPT = 'PS> ';
+
+  /** promptLine 의 명령을 B→C 로 시작한다(아직 끝나지 않았다). */
+  function startCommand(fake: ReturnType<typeof createFakeTerminal>, promptLine: number) {
+    fake.buffer.cursorY = promptLine;
+    fake.buffer.cursorX = PROMPT.length;
+    notePromptCommandStart(SESSION, fake.terminal);
+    fake.buffer.cursorY = promptLine + 1;
+    fake.buffer.cursorX = 0;
+    beginCommandBlock(SESSION, fake.terminal, null);
+  }
+
+  /** ls(0~1)를 끝내고 cls(2)를 실행 중인 상태. */
+  function setUp() {
+    const rows = [`${PROMPT}ls`, 'a', `${PROMPT}cls`, ''];
+    const fake = createFakeTerminal(rows);
+    startCommand(fake, 0);
+    fake.buffer.cursorY = 2;
+    finishCommandBlock(SESSION, fake.terminal, 0);
+    startCommand(fake, 2);
+    const [ls, cls] = getCommandBlocks(SESSION);
+    expect(cls.command).toBe('cls');
+    return { rows, fake, ls, cls };
+  }
+
+  it('끝날 때 커서가 명령 줄보다 위로 가 있고 그 사이가 비었으면 그 줄들의 블록 위치를 버린다', () => {
+    const { rows, fake, ls, cls } = setUp();
+
+    // cls: 화면을 비우고 커서를 맨 위로 옮긴 뒤 D 가 온다(프롬프트는 그 뒤에 그려진다).
+    rows.fill('');
+    fake.buffer.cursorY = 0;
+    finishCommandBlock(SESSION, fake.terminal, 0);
+
+    expect(ls.marker.line).toBe(-1);
+    expect(cls.marker.line).toBe(-1);
+    expect(fake.decorations.every((decoration) => decoration.disposed)).toBe(true);
+    expect(cls.state).toBe('ok');
+    // 기록은 남는다.
+    expect(getCommandBlocks(SESSION)).toEqual([ls, cls]);
+    for (let line = 0; line < rows.length; line += 1) {
+      expect(getCommandBlockAtLine(SESSION, line)).toBeNull();
+    }
+  });
+
+  // 창 크기를 바꾼 직후 ConPTY 가 화면을 다시 그렸는데 위치를 맞추기 전에 명령이 끝난 경우가 이렇다.
+  it('그 사이에 글자가 남아 있으면 지운 것이 아니므로 건드리지 않는다', () => {
+    const { fake, ls, cls } = setUp();
+
+    fake.buffer.cursorY = 0;
+    finishCommandBlock(SESSION, fake.terminal, 0);
+
+    expect(ls.marker.line).toBe(0);
+    expect(cls.marker.line).toBe(2);
+    expect(cls.decoration).not.toBeNull();
+  });
+});
+
+/**
+ * 실제 xterm 으로 확인한다. 지운 줄의 마커는 xterm 이 없애고(명령 줄이 화면 안에 있던 블록), 스크롤백에서
+ * 시작한 블록은 우리가 끝을 당긴다. 런타임처럼 CSI J 핸들러를 걸어 xterm 의 지우기 직전에 부른다.
+ */
+describe('화면을 지운 뒤 블록 범위 (실제 xterm)', () => {
+  const session = 'screen-erase';
+
+  afterEach(() => {
+    clearCommandBlocks(session);
+  });
+
+  function createTerminal() {
+    const terminal = new HeadlessTerminal({ cols: 20, rows: 5, scrollback: 100, allowProposedApi: true });
+    // headless 에는 데코레이션이 없다 — 여기서 보는 것은 마커와 범위다.
+    (terminal as unknown as { registerDecoration: () => undefined }).registerDecoration = () =>
+      undefined;
+    const term = terminal as unknown as Terminal;
+    terminal.parser.registerCsiHandler({ final: 'J' }, (params) => {
+      if (params[0] === 2) {
+        noteScreenErased(session, term);
+      }
+      return false;
+    });
+    const write = (data: string) =>
+      new Promise<void>((resolve) => {
+        terminal.write(data, resolve);
+      });
+    const lineText = (line: number) =>
+      terminal.buffer.active.getLine(line)?.translateToString(true);
+    return { terminal, term, write, lineText };
+  }
+
+  /** 실측한 ConPTY 의 cls: 맨 위로 가서 줄마다 지우고, 스크롤백을 지운 뒤 한 번 더 지우고 맨 위로. */
+  async function runConptyCls(
+    terminal: HeadlessTerminal,
+    term: Terminal,
+    write: (data: string) => Promise<void>,
+  ) {
+    await write('PS> ');
+    notePromptCommandStart(session, term);
+    await write('cls\r\n');
+    beginCommandBlock(session, term, null);
+    const blankScreen = `${'\x1b[K\r\n'.repeat(terminal.rows - 1)}\x1b[K\x1b[H`;
+    await write(`\x1b[H${blankScreen}\x1b[3J${blankScreen}`);
+    finishCommandBlock(session, term, 0);
+    await write('PS> ');
+    notePromptCommandStart(session, term);
+  }
+
+  // 스크롤백이 없으면 ESC[3J 가 지울 것도 없다 — 화면에 있던 블록이 그대로 남아 점이 빈 화면에 찍혔다.
+  it('짧은 기록 뒤 cls: 화면에 있던 블록이 모두 위치를 잃는다', async () => {
+    const { terminal, term, write } = createTerminal();
+    try {
+      await write('PS> ');
+      notePromptCommandStart(session, term);
+      await write('echo a\r\n');
+      beginCommandBlock(session, term, null);
+      await write('a\r\n');
+      finishCommandBlock(session, term, 0);
+      expect(terminal.buffer.active.baseY).toBe(0);
+
+      await runConptyCls(terminal, term, write);
+
+      const blocks = getCommandBlocks(session);
+      expect(blocks.map((block) => block.command)).toEqual(['echo a', 'cls']);
+      expect(blocks.map((block) => block.marker.line)).toEqual([-1, -1]);
+      for (let line = 0; line < terminal.rows; line += 1) {
+        expect(getCommandBlockAtLine(session, line)).toBeNull();
+      }
+    } finally {
+      terminal.dispose();
+    }
+  });
+
+  it('긴 출력 뒤 cls: 빈 화면에 cls 의 블록이 남지 않는다', async () => {
+    const { terminal, term, write } = createTerminal();
+    try {
+      await write('PS> ');
+      notePromptCommandStart(session, term);
+      await write('seq\r\n');
+      beginCommandBlock(session, term, null);
+      await write('1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n');
+      finishCommandBlock(session, term, 0);
+
+      await runConptyCls(terminal, term, write);
+
+      const [seq, cls] = getCommandBlocks(session);
+      expect(cls.command).toBe('cls');
+      expect(cls.state).toBe('ok');
+      // seq 는 스크롤백과 함께, cls 는 화면이 다시 쓰여 위치를 잃는다. 기록은 둘 다 남는다.
+      expect(seq.marker.line).toBe(-1);
+      expect(cls.marker.line).toBe(-1);
+      const baseY = terminal.buffer.active.baseY;
+      for (let line = baseY; line < baseY + terminal.rows; line += 1) {
+        expect(getCommandBlockAtLine(session, line)).toBeNull();
+      }
+    } finally {
+      terminal.dispose();
+    }
+  });
+
+  it('Ctrl+L 뒤 빈 화면의 어느 줄도 예전 블록에 걸리지 않는다', async () => {
+    const { terminal, term, write, lineText } = createTerminal();
+    try {
+      await write('PS> ');
+      notePromptCommandStart(session, term);
+      await write('seq\r\n');
+      beginCommandBlock(session, term, null);
+      await write('1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n');
+      finishCommandBlock(session, term, 0);
+      await write('PS> ');
+      notePromptCommandStart(session, term);
+      await write('echo hi\r\n');
+      beginCommandBlock(session, term, null);
+      await write('hi\r\n');
+      finishCommandBlock(session, term, 0);
+      await write('PS> ');
+      notePromptCommandStart(session, term);
+
+      // 화면(5행): ['5', '6', 'PS> echo hi', 'hi', 'PS>'] — seq 의 명령 줄은 스크롤백에 있다.
+      const baseY = terminal.buffer.active.baseY;
+      expect(baseY).toBe(5);
+      const [seq, echo] = getCommandBlocks(session);
+      expect(getCommandBlockAtLine(session, baseY)).toBe(seq);
+
+      // PowerShell 의 Ctrl+L: ConPTY 가 화면을 지우고 맨 위에 프롬프트를 다시 그린다.
+      await write('\x1b[2J\x1b[HPS> ');
+      notePromptCommandStart(session, term);
+
+      for (let line = baseY; line < baseY + terminal.rows; line += 1) {
+        expect(getCommandBlockAtLine(session, line)).toBeNull();
+      }
+      // seq 는 명령 줄과 스크롤백에 남은 출력으로 산다.
+      expect(lineText(seq.marker.line)).toBe('PS> seq');
+      expect(seq.endLine).toBe(baseY - 1);
+      expect(readBlockOutput(session, term, seq)).toBe('1\n2\n3\n4');
+      // echo 는 명령 줄이 지워져 위치를 잃었다(xterm 이 마커를 없앤다). 기록은 남는다.
+      expect(echo.marker.line).toBe(-1);
+      expect(getCommandBlocks(session)).toHaveLength(2);
+    } finally {
+      terminal.dispose();
     }
   });
 });

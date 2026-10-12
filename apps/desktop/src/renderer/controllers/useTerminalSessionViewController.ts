@@ -47,6 +47,7 @@ import {
   noteContinuationPrompt,
   notePromptCommandStart,
   noteReportedCommand,
+  noteScreenErased,
   readBlockOutput,
   type ConptyBlockRealigner,
 } from '../lib/terminal-command-blocks';
@@ -1178,6 +1179,14 @@ export function useTerminalSessionViewController({
           // 터미널 파일 드롭(SFTP 업로드) 핸들러가 드롭 시점에 읽을 수 있도록
           // 세션 cwd를 모듈 레지스트리에 보관한다.
           setSessionCwd(liveSessionIdRef.current, parseCwdFromOsc7(data));
+        },
+        onScreenErase: () => {
+          // Ctrl+L·clear·cls 로 화면이 지워지기 직전이다. 명령 블록이 지워질 줄을 계속 자기 범위로
+          // 잡으면 빈 화면 위에 블록 강조와 툴바가 뜬다.
+          const blockTerminal = terminalRef.current;
+          if (blockTerminal) {
+            noteScreenErased(liveSessionIdRef.current, blockTerminal);
+          }
         },
       });
       setTerminalInitError(null);

@@ -167,6 +167,60 @@ describe('terminal-runtime', () => {
     expect((terminal.options as Record<string, unknown>).windowsPty).toEqual({ backend: 'conpty' });
   });
 
+  // Ctrl+L·clear·cls 가 보내는 화면 전체 지우기(ESC[2J)를 지우기 직전에 알린다. 지우기 자체는 막지
+  // 않는다(false) — 막으면 화면이 지워지지 않는다.
+  it('화면 전체 지우기(ED2)만 지우기 직전에 알리고 xterm 의 지우기는 그대로 둔다', () => {
+    const container = document.createElement('div');
+    const { terminal } = createFakeTerminal();
+    const csiHandlers: Array<{
+      id: unknown;
+      callback: (params: (number | number[])[]) => boolean;
+    }> = [];
+    const disposeCsiHandler = vi.fn();
+    Object.assign(terminal, {
+      parser: {
+        registerCsiHandler: vi.fn(
+          (id: unknown, callback: (params: (number | number[])[]) => boolean) => {
+            csiHandlers.push({ id, callback });
+            return { dispose: disposeCsiHandler } satisfies IDisposable;
+          }
+        )
+      }
+    });
+    const onScreenErase = vi.fn();
+    const runtime = createTerminalRuntime({
+      container,
+      appearance: createAppearance(),
+      onData: vi.fn(),
+      onBinary: vi.fn(),
+      onScreenErase,
+      dependencies: {
+        createTerminal: (() => terminal) as never,
+        createFitAddon: (() => ({ fit: vi.fn(), activate: vi.fn(), dispose: vi.fn() })) as never,
+        createSearchAddon: (() => ({
+          activate: vi.fn(), dispose: vi.fn(), findNext: vi.fn(() => true),
+          findPrevious: vi.fn(() => true), clearDecorations: vi.fn(), clearActiveDecoration: vi.fn()
+        })) as never,
+        createUnicode11Addon: (() => ({ activate: vi.fn(), dispose: vi.fn() })) as never,
+        openExternal: vi.fn()
+      }
+    });
+
+    expect(csiHandlers).toHaveLength(1);
+    expect(csiHandlers[0]?.id).toEqual({ final: 'J' });
+    const handler = csiHandlers[0]!.callback;
+    expect(handler([2])).toBe(false);
+    expect(onScreenErase).toHaveBeenCalledTimes(1);
+    // 커서 아래만(0)·위만(1)·스크롤백(3) 지우기는 알리지 않는다.
+    for (const mode of [0, 1, 3]) {
+      expect(handler([mode])).toBe(false);
+    }
+    expect(onScreenErase).toHaveBeenCalledTimes(1);
+
+    runtime.dispose();
+    expect(disposeCsiHandler).toHaveBeenCalled();
+  });
+
   // 실기기에서 두 번째 tmux 창이 깨진 원인. initialSize 로 만들어도 open() 직후 컨테이너에 fit 하면
   // 격자가 컨테이너 픽셀(tmux 와 한두 칸 어긋남)로 바뀌고, 마운트 직후 재생되는 백로그(복원 바이트)가
   // 그 격자에 쓰인다 — 뒤에 칸 수를 바로잡아도 감긴 줄은 되돌아오지 않는다.

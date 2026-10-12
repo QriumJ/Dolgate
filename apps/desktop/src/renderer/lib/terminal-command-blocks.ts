@@ -693,6 +693,45 @@ function finishCommandBlockUnsafe(
   closeRunningBlock(session, sessionId, terminal, exitCode);
 }
 
+/**
+ * firstLine~lastLine(절대 행, 포함)이 지워졌을 때 블록을 정리한다. 바뀐 것이 있으면 true.
+ *
+ * 그 줄에서 시작한 블록은 명령 줄이 사라졌으므로 위치를 잃는다(기록은 남는다 — bindBlockMarker).
+ * 그 위에서 시작해 그 줄까지 이어지던 끝난 블록은 firstLine 바로 위에서 끝난다 — 남은 출력은 그대로
+ * 그 블록 것이다. 실행 중인 블록의 끝은 건드리지 않는다: 지운 뒤 나오는 출력도 그 명령 것이다.
+ */
+function releaseErasedLines(session: SessionBlocks, firstLine: number, lastLine: number): boolean {
+  let changed = false;
+  for (const block of session.blocks) {
+    const start = block.marker.line;
+    if (start < 0) {
+      continue;
+    }
+    if (start >= firstLine) {
+      if (start <= lastLine) {
+        block.marker.dispose();
+        changed = true;
+      }
+      continue;
+    }
+    if (block.endLine !== null && block.endLine >= firstLine) {
+      block.endLine = firstLine - 1;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+/** 그 줄들(절대 행, 포함)에 글자가 하나도 없는가. */
+function linesAreBlank(buffer: IBuffer, firstLine: number, lastLine: number): boolean {
+  for (let line = firstLine; line <= lastLine; line += 1) {
+    if (buffer.getLine(line)?.translateToString(true)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /** 가장 최근 실행 중 블록을 닫는다. 없으면 아무 일도 하지 않는다. */
 function closeRunningBlock(
   session: SessionBlocks,
@@ -716,12 +755,57 @@ function closeRunningBlock(
     const buffer = terminal.buffer.active;
     const cursorLine = buffer.baseY + buffer.cursorY;
     block.endLine = Math.max(block.marker.line, buffer.cursorX === 0 ? cursorLine - 1 : cursorLine);
+    // 끝날 때 커서가 자기 명령 줄보다 **위**에 있고 그 사이가 텅 비었으면 화면이 지워진 것이다.
+    // PowerShell 의 `cls` 가 그렇다: ConPTY 는 ESC[2J 없이 맨 위부터 줄마다 지우고(ESC[K) 스크롤백을
+    // 지운다(ESC[3J). 줄마다 지우기는 마커를 없애지 않아, 빈 화면에 `cls` 와 그 앞 명령들의 점이 남고
+    // 그 줄에 블록이 걸렸다(실측). ESC[2J 때와 같이 정리한다.
+    //
+    // 비었는지까지 보는 이유: 창 크기를 바꾼 직후 ConPTY 가 화면을 다시 그려 명령 줄이 올라갔는데 위치를
+    // 맞추기(realignCommandBlocks) 전에 명령이 끝나면, 커서가 옛 마커보다 위일 수 있다. 그때는 화면에
+    // 내용이 그대로 있으므로 건드리지 않는다.
+    if (
+      block.marker.line >= 0 &&
+      cursorLine < block.marker.line &&
+      linesAreBlank(buffer, cursorLine, block.marker.line)
+    ) {
+      releaseErasedLines(session, cursorLine, block.marker.line);
+    }
     if (block.decoration?.element) {
       applyDecorationStyle(block, block.decoration.element);
     }
     notifyCommandBlocksChanged(session, sessionId);
     return;
   }
+}
+
+/**
+ * 화면 전체 지우기(ED2, `ESC[2J`) 직전에 부른다. 지워지는 화면에 걸쳐 있던 끝난 블록을 지워지는
+ * 줄 바로 위에서 끝나게 한다.
+ *
+ * Ctrl+L(PowerShell·bash·zsh 모두)이 이것으로 화면을 지우고 맨 위에 프롬프트를 다시 그린다. xterm 은
+ * 보이는 화면을 그 자리에서 지우고(스크롤백으로 밀어 올리지 않는다) 지운 줄의 마커를 없앤다 — 명령
+ * 줄이 화면 안에 있던 블록은 그렇게 위치를 잃는다. 그런데 출력이 화면보다 길어 명령 줄은 스크롤백에
+ * 있고 출력만 화면에 걸쳐 있던 블록은 마커가 살아 있고, endLine 은 숫자라 그대로다. 그 블록이 텅 빈
+ * 화면 전체를 자기 범위로 잡아, 마우스를 올리면 강조와 툴바가 화면 전체에 떴다(실측).
+ *
+ * 실행 중인 블록은 건드리지 않는다 — 화면을 지운 뒤 나오는 출력도 그 명령의 것이다.
+ */
+export function noteScreenErased(sessionId: string, terminal: Terminal): void {
+  safely(sessionId, undefined, () => {
+    if (!sessionId || !isNormalBuffer(terminal)) {
+      return;
+    }
+    const session = sessions.get(sessionId);
+    if (!session) {
+      return;
+    }
+    // 지워지는 것은 보이는 화면(활성 영역) 전체다. 그 위의 스크롤백은 남는다. 화면에서 시작한 블록의
+    // 마커는 xterm 도 지우면서 없애지만, 정리는 한곳(releaseErasedLines)에서 한다.
+    const firstErasedLine = terminal.buffer.active.baseY;
+    if (releaseErasedLines(session, firstErasedLine, firstErasedLine + terminal.rows - 1)) {
+      notifyCommandBlocksChanged(session, sessionId);
+    }
+  });
 }
 
 /** 최근 순서(오래된 → 최신)로 이 세션의 명령 블록을 돌려준다. */

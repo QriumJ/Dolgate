@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => ({
   reinjectShellIntegration: vi.fn().mockResolvedValue(undefined),
   // 화면에서 읽은 명령을 돌려주는 자리. 서브셸 진입 판정이 이 값을 쓴다.
   beginCommandBlock: vi.fn<(...args: unknown[]) => string | null>(() => null),
+  noteScreenErased: vi.fn(),
   runtimeRecords: [] as any[],
   schedulerRecords: [] as Array<{
     scheduler: { request: ReturnType<typeof vi.fn>; reset: ReturnType<typeof vi.fn> };
@@ -39,6 +40,7 @@ vi.mock('../services/desktop/terminal', async (importOriginal) => ({
 vi.mock('../lib/terminal-command-blocks', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   beginCommandBlock: (...args: unknown[]) => mocks.beginCommandBlock(...args),
+  noteScreenErased: (...args: unknown[]) => mocks.noteScreenErased(...args),
 }));
 
 vi.mock('../lib/terminal-runtime', () => ({
@@ -637,6 +639,23 @@ describe('useTerminalSessionViewController', () => {
 
     expect(record.scheduler.reset.mock.calls.length).toBeGreaterThan(resetsBefore);
     expect(record.scheduler.request.mock.calls.length).toBeGreaterThan(requestsBefore);
+  });
+
+  // Ctrl+L·clear·cls 로 화면이 지워지면 명령 블록이 지워진 줄을 계속 잡지 않게 알린다. 셸과 상관없는
+  // 일이라(로컬 PowerShell·SSH bash 모두 실측) 모든 세션에 건다.
+  it('화면 전체 지우기 알림을 이 세션의 명령 블록에 넘긴다', async () => {
+    vi.mocked(createTerminalRuntime).mockClear();
+    mocks.noteScreenErased.mockClear();
+    renderController(createProps());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(50);
+    });
+    expect(vi.mocked(createTerminalRuntime)).toHaveBeenCalledTimes(1);
+    const [options] = vi.mocked(createTerminalRuntime).mock.calls[0] ?? [];
+    const runtime = mocks.runtimeRecords.at(-1);
+
+    options?.onScreenErase?.();
+    expect(mocks.noteScreenErased).toHaveBeenCalledWith('session-1', runtime.terminal);
   });
 
   // Windows 로컬 셸은 ConPTY 안에서 돈다. ConPTY 는 리사이즈 때 자기 화면 사본을 위쪽부터 다시

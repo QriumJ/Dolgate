@@ -130,6 +130,11 @@ interface CreateTerminalRuntimeOptions {
    * emitted by the remote shell.
    */
   onCwd?: (data: string) => void;
+  /**
+   * 화면 전체 지우기(ED2, `ESC[2J`)가 적용되기 **직전**에 불린다. 지우기 자체는 그대로 일어난다 —
+   * 명령 블록이 지워질 줄을 계속 자기 범위로 잡지 않게 알려 주는 용도다(Ctrl+L·clear·cls).
+   */
+  onScreenErase?: () => void;
   dependencies?: CreateTerminalRuntimeDependencies;
 }
 
@@ -345,6 +350,7 @@ export function createTerminalRuntime({
   onBinary,
   onShellIntegration,
   onCwd,
+  onScreenErase,
   dependencies = {},
   initialSize,
   windowsPty,
@@ -459,6 +465,22 @@ export function createTerminalRuntime({
       });
     } catch (error) {
       safeWarn(logger, 'OSC 7 cwd reporting unavailable, continuing without directory context.', error);
+    }
+  }
+
+  let screenEraseDisposable: IDisposable | null = null;
+  if (onScreenErase) {
+    try {
+      // CSI 2 J (ED2). false 를 돌려 xterm 의 기본 처리(실제 지우기)는 그대로 이어지게 한다. 이
+      // 핸들러가 먼저 불리므로 지워질 줄의 번호를 지우기 전 그대로 읽을 수 있다.
+      screenEraseDisposable = terminal.parser.registerCsiHandler({ final: 'J' }, (params) => {
+        if (params[0] === 2) {
+          onScreenErase();
+        }
+        return false;
+      });
+    } catch (error) {
+      safeWarn(logger, 'Screen erase hook unavailable, continuing without command block trimming.', error);
     }
   }
 
@@ -799,6 +821,7 @@ export function createTerminalRuntime({
       webLinksAddon?.dispose();
       shellIntegrationDisposable?.dispose();
       cwdDisposable?.dispose();
+      screenEraseDisposable?.dispose();
       disposeBinarySubscription.dispose();
       disposeDataSubscription.dispose();
       terminal.dispose();
