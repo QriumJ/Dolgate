@@ -11,6 +11,11 @@ import { terminalThemePresets } from '../lib/terminal-presets';
 import { useTerminalSessionViewController } from './useTerminalSessionViewController';
 import { createTerminalRuntime } from '../lib/terminal-runtime';
 import { saveScrollbackSnapshot } from '../lib/terminal-write-registry';
+import {
+  clearSessionCwd,
+  getSessionLastCommandAt,
+} from '../lib/terminal-cwd-registry';
+import { appStore } from '../store/appStore';
 
 const mocks = vi.hoisted(() => ({
   reinjectShellIntegration: vi.fn().mockResolvedValue(undefined),
@@ -369,6 +374,52 @@ describe('useTerminalSessionViewController', () => {
     });
 
     expect(mocks.reinjectShellIntegration).not.toHaveBeenCalled();
+  });
+
+  describe('탭 점의 명령 상태', () => {
+    afterEach(() => {
+      appStore.setState({ tabs: [] });
+      clearSessionCwd('session-1');
+    });
+
+    // 셸 통합은 프롬프트를 그릴 때마다 직전 $? 를 D 로 보낸다. macOS 기본 bash(3.2)는
+    // 프롬프트에서 Ctrl+C 만 눌러도 $? 가 1 이라, C 없이 온 D 를 받으면 아무것도 안 했는데
+    // 점이 빨개진다.
+    it('명령 없이 다시 그린 프롬프트의 종료 코드로는 바꾸지 않는다', async () => {
+      appStore.setState({ tabs: [baseTab] });
+      renderController(createProps());
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(50);
+      });
+      const runtime = mocks.runtimeRecords[0];
+      const commandState = () =>
+        appStore.getState().tabs.find((tab) => tab.sessionId === 'session-1')
+          ?.commandState ?? null;
+
+      // 연결 직후의 첫 프롬프트, 이어서 프롬프트에서 누른 Ctrl+C.
+      await act(async () => {
+        runtime.emitShellIntegration('D;0');
+        runtime.emitShellIntegration('D;1');
+      });
+      expect(commandState()).toBeNull();
+      expect(getSessionLastCommandAt('session-1')).toBeNull();
+
+      // 실행한 명령의 실패는 그대로 빨갛다. 빠른 명령은 C 와 D 가 한 청크로 온다.
+      await act(async () => {
+        runtime.emitShellIntegration('C');
+        runtime.emitShellIntegration('D;1');
+      });
+      expect(commandState()).toBe('failed');
+      expect(getSessionLastCommandAt('session-1')).not.toBeNull();
+
+      // 성공한 뒤 프롬프트에서 Ctrl+C — 성공이 그대로 남는다.
+      await act(async () => {
+        runtime.emitShellIntegration('C');
+        runtime.emitShellIntegration('D;0');
+        runtime.emitShellIntegration('D;1');
+      });
+      expect(commandState()).toBe('ok');
+    });
   });
 
   it('resets prompt, search, and share state when the session changes', async () => {

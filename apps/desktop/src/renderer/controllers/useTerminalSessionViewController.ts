@@ -1121,16 +1121,30 @@ export function useTerminalSessionViewController({
                 exitCode,
               );
             }
-            appStore
-              .getState()
-              .applyTabCommandState(
-                liveSessionIdRef.current,
-                // Ctrl+C 로 끊은 명령(130)은 실패가 아니다 — 탭 점을 빨갛게 하지 않는다. 셸
-                // 통합은 프롬프트마다 직전 $? 를 보내므로, bash 에서는 명령 없이 프롬프트에서
-                // Ctrl+C 만 눌러도 130 이 온다.
+            /**
+             * 탭 점과 "마지막 명령" 은 **실행된 명령**의 결과만 받는다.
+             *
+             * 셸 통합은 프롬프트를 그릴 때마다 직전 $? 를 D 로 보낸다. C(명령 시작) 없이 온 D 는
+             * 프롬프트를 다시 그린 것뿐이다(빈 Enter, 프롬프트에서 누른 Ctrl+C). 그 값을 받으면
+             * macOS 기본 bash(3.2)에서는 프롬프트에서 Ctrl+C 만 눌러도 $? 가 1 이라 아무것도
+             * 안 했는데 점이 빨개졌다. 블록도 C 에서만 열리므로 같은 기준이다.
+             *
+             * 렌더된 prop 이 아니라 스토어에서 바로 읽는다 — 빠른 명령은 C 와 D 가 한 청크로
+             * 와서, 그 사이에 렌더가 없다.
+             */
+            const finishedSessionId = liveSessionIdRef.current;
+            const store = appStore.getState();
+            const commandState = store.tabs.find(
+              (entry) => entry.sessionId === finishedSessionId,
+            )?.commandState;
+            if (commandState === 'running') {
+              store.applyTabCommandState(
+                finishedSessionId,
+                // Ctrl+C 로 끊은 명령(130)은 실패가 아니다 — 탭 점을 빨갛게 하지 않는다.
                 classifyCommandExit(exitCode) === 'failed' ? 'failed' : 'ok',
               );
-            setSessionLastCommandAt(liveSessionIdRef.current);
+              setSessionLastCommandAt(finishedSessionId);
+            }
           }
         },
         onCwd: (data) => {
