@@ -125,6 +125,10 @@ export interface ServerInfoResponse {
        * 그 보호가 필요한 기능(RDP 호스트 추가)을 닫는다.
        */
       dataFloor?: boolean;
+      /**
+       * 변경 대기(GET /sync/watch, 롱폴링)를 지원하는가. 없으면 30초 폴링으로 물러선다.
+       */
+      watch?: boolean;
     };
     sessions: {
       awsSsm: boolean;

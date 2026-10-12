@@ -5,6 +5,7 @@ import type {
   DesktopWindowState,
   UpdateState,
 } from '@shared';
+import { startSyncWatchLoop } from '@shared';
 import { AuthBootstrapBridge } from './bridges/AuthBootstrapBridge';
 import { DesktopEventBridge } from './bridges/DesktopEventBridge';
 import { NetworkBridge } from './bridges/NetworkBridge';
@@ -19,6 +20,7 @@ import {
   bootstrapSync,
   consumeWindowLaunchIntent,
   getAuthState,
+  watchSync,
 } from './services/desktop/auth-window-updater';
 import {
   useAiChatViewModel,
@@ -316,9 +318,9 @@ export function App() {
     return new Date(authState.offline.expiresAt).toLocaleString(getFormatLocale());
   }, [authState.offline?.expiresAt]);
 
-  // 다른 기기의 변경을 받아오는 폴링. 서버가 조건부 GET(ETag)을 지원하므로 변경이 없으면
-  // 304 로 초경량이다. 창 포커스 복귀 시 즉시 1회 + 30초 주기로 당긴다. 온라인 인증 +
-  // 볼트 게이트 아님 + 초기 동기화 완료일 때만 돌고, 진행 중이면 겹치지 않게 건너뛴다.
+  // 다른 기기의 변경을 받아온다. 서버의 변경 대기(롱폴링)에 붙어 있다가 바뀌는 순간 당긴다.
+  // 서버가 대기를 모르면(옛 자체 호스팅) 메인이 30초마다 'changed' 를 돌려줘 예전 30초 폴링과
+  // 같아진다. 온라인 인증 + 볼트 게이트 아님 + 초기 동기화 완료일 때만 돈다.
   const refreshSyncedWorkspaceData = homeViewModel.refreshSyncedWorkspaceData;
   const pollableUserId =
     authState.status === 'authenticated' &&
@@ -334,13 +336,12 @@ export function App() {
     if (!pollableUserId) {
       return;
     }
-    let inFlight = false;
-    const pull = async () => {
-      // 겹침 방지 + 하이드레이션 진행 중이면 그쪽이 첫 pull 을 담당한다.
-      if (inFlight || activeHydrationUserIdRef.current === pollableUserId) {
-        return;
+    // 당기기에 성공했는가 — 대기 루프는 실패하면 물러선다(같은 리비전으로 즉시 반복하지 않게).
+    const runPull = async (): Promise<boolean> => {
+      // 하이드레이션 진행 중이면 그쪽이 첫 pull 을 담당한다. 루프는 잠시 물러섰다 다시 본다.
+      if (activeHydrationUserIdRef.current === pollableUserId) {
+        return false;
       }
-      inFlight = true;
       try {
         // 조건부 GET(ETag). 변경이 없으면 서버가 304 라 lastDataChangeAt 이 그대로이고,
         // 그때는 워크스페이스 재조회(IPC)를 건너뛴다 — 304 최적화를 UI 까지 이어간다.
@@ -354,27 +355,47 @@ export function App() {
           await refreshSyncedWorkspaceData();
           lastDataChangeRef.current = changeAt;
           hydratedOnlineSessionUserIdRef.current = pollableUserId;
-          return;
+          return status?.status === 'ready';
         }
         if (changeAt !== lastDataChangeRef.current) {
           await refreshSyncedWorkspaceData();
           lastDataChangeRef.current = changeAt;
         }
+        return status?.status === 'ready';
       } catch {
         // auth/vault 오류는 auth 브로드캐스트로 별도 처리된다.
-      } finally {
-        inFlight = false;
+        return false;
       }
     };
-    const interval = window.setInterval(() => {
-      void pull();
-    }, 30_000);
+    // 포커스와 대기 루프가 동시에 당기면 진행 중인 것을 함께 기다린다.
+    let pullInFlight: Promise<boolean> | null = null;
+    const pull = () => {
+      pullInFlight ??= runPull().finally(() => {
+        pullInFlight = null;
+      });
+      return pullInFlight;
+    };
+    // 서버가 실제로 기다려 주는가(롱폴링). 아니면 창 포커스 때 당긴다(예전 동작).
+    let live = false;
+    const loop = startSyncWatchLoop({
+      watch: async () => {
+        const result = await watchSync();
+        live = result.live;
+        return result.outcome;
+      },
+      onChange: pull,
+    });
     const onFocus = () => {
+      if (live) {
+        // 이미 변경을 기다리고 있다. 실패로 물러나 있었다면 바로 다시 붙는다.
+        loop.retryNow();
+        return;
+      }
       void pull();
     };
     window.addEventListener('focus', onFocus);
     return () => {
-      window.clearInterval(interval);
+      loop.stop();
       window.removeEventListener('focus', onFocus);
     };
   }, [pollableUserId, refreshSyncedWorkspaceData]);

@@ -21,6 +21,22 @@ export function registerSyncIpcHandlers(ctx: MainIpcContext): void {
     }
   });
 
+  ipcMain.handle(ipcChannels.sync.watch, async () => {
+    try {
+      return await ctx.syncService.watchForChanges();
+    } catch (error) {
+      if (
+        isSyncAuthenticationError(error) &&
+        ctx.authService.getState().status === "authenticated"
+      ) {
+        await ctx.authService.forceUnauthenticated(
+          t('auth.sessionExpired'),
+        );
+      }
+      throw error;
+    }
+  });
+
   ipcMain.handle(ipcChannels.sync.pushDirty, async () => {
     try {
       return await ctx.syncService.pushDirty();

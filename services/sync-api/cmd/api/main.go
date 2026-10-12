@@ -75,6 +75,7 @@ func main() {
 	awsSshTunnelRelay := httpserver.NewAwsSshTunnelRelay(awsSsmRuntime)
 	defer awsSshTunnelRelay.Close()
 	awsSsoMobileManager := httpserver.NewAwsSsoMobileManager()
+	syncWatch := httpserver.NewSyncWatchHub(dbStore, 0)
 	router, err := httpserver.NewRouter(dbStore, authService, httpserver.RouterConfig{
 		LocalAuthEnabled:   cfg.Auth.Local.Enabled,
 		LocalSignupEnabled: cfg.Auth.Local.SignupEnabled,
@@ -129,6 +130,7 @@ func main() {
 		AwsSessionBridge:  awsSessionBridge,
 		AwsSftpBridge:     awsSftpBridge,
 		AwsSshTunnelRelay: awsSshTunnelRelay,
+		SyncWatch:         syncWatch,
 	})
 	if err != nil {
 		log.Fatalf("create router: %v", err)
@@ -140,6 +142,9 @@ func main() {
 	}
 
 	server := &http.Server{Handler: router}
+	// 동기화 롱폴링(GET /sync/watch) 대기자는 최대 30초 열려 있어, 그대로 두면 아래 종료 유예
+	// (10초) 안에 끝나지 않는다. Shutdown 이 시작되자마자 전부 풀어 준다(클라이언트는 다시 붙는다).
+	server.RegisterOnShutdown(syncWatch.Close)
 	serveErrCh := make(chan error, 1)
 	go func() {
 		serveErrCh <- server.Serve(listener)

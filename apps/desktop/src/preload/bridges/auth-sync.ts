@@ -51,6 +51,7 @@ export function buildSyncBridge(
 ): DesktopApi["sync"] {
   return {
     bootstrap: () => ipcRenderer.invoke(ipcChannels.sync.bootstrap),
+    watch: () => ipcRenderer.invoke(ipcChannels.sync.watch),
     pushDirty: () => ipcRenderer.invoke(ipcChannels.sync.pushDirty),
     status: () => ipcRenderer.invoke(ipcChannels.sync.status),
     exportDecryptedSnapshot: () =>

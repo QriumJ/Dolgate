@@ -247,6 +247,9 @@ type Store interface {
 	// GetSyncGate 는 /sync 게이트가 보는 값(존재 여부, 데이터 하한, 리비전)을 users 행 한 번으로
 	// 읽는다. 행이 없으면 Exists 가 false 다 — 탈퇴한 사용자다.
 	GetSyncGate(ctx context.Context, userID string) (SyncGate, error)
+	// GetSyncRevisions 는 여러 사용자의 리비전을 한 번에 읽는다 — 롱폴링 대기자 묶음 확인용.
+	// 없는 사용자(탈퇴)는 결과에 키가 없다.
+	GetSyncRevisions(ctx context.Context, userIDs []string) (map[string]int64, error)
 
 	// 유저 존재 확인 — 탈퇴 직후 잔여 access 토큰의 sync 재유입(데이터 부활) 차단용.
 	// "행 없음"은 (false, nil), 드라이버 에러만 err 로 돌려준다.

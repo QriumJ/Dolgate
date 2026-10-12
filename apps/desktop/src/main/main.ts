@@ -926,7 +926,10 @@ if (termiusHelperArgIndex >= 0) {
 
     // 절전/화면잠금에서 복귀하면 navigator.onLine이 true여도 SSH 소켓이 죽어
     // 있을 수 있다. 렌더러에 알려 자동 재연결이 모든 세션을 즉시 재검증하게 한다.
+    // 동기화 변경 대기도 같은 이유로 끊는다 — 죽은 연결을 45초 타임아웃까지 붙들지 않고
+    // 바로 다시 붙어, 잠든 사이 다른 기기에서 바뀐 것을 곧장 받는다.
     const notifyResume = () => {
+      syncService.interruptWatch();
       for (const window of BrowserWindow.getAllWindows()) {
         if (!window.isDestroyed()) {
           window.webContents.send(ipcChannels.system.resume);

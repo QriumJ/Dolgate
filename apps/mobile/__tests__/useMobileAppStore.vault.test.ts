@@ -2234,6 +2234,149 @@ describe('useMobileAppStore vault flows', () => {
     expect(appStateSpy).toHaveBeenCalledWith('change', expect.any(Function));
     appStateSpy.mockRestore();
   });
+  // 포그라운드에서는 서버의 변경 대기(롱폴링)에 붙어 있다가, 다른 기기가 바꾸면 그 순간 당긴다.
+  // 백그라운드로 가면 대기를 끊는다. 서버 흉내는 실제 서버와 같은 규칙으로 답한다 — 클라이언트가
+  // 든 리비전이 낡았으면 바로 200, 최신이면 붙잡아 둔다.
+  it('waits for changes in the foreground and pulls the moment another device pushes', async () => {
+    const keyBase64 = Buffer.alloc(32, 3).toString('base64');
+    const session = createLegacyAuthSession(keyBase64);
+    let serverRevision = 9;
+    let pulls = 0;
+    const watches: Array<{ known: string | undefined; signal?: AbortSignal | null }> = [];
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      if (path === '/api/info') {
+        return createJsonResponse({
+          serverVersion: 'test',
+          capabilities: {
+            sync: { awsProfiles: true, watch: true },
+            sessions: { awsSsm: true },
+            vault: { e2ee: true },
+          },
+        });
+      }
+      if (path === '/sync' && init?.method !== 'POST') {
+        pulls += 1;
+        return createJsonResponse(buildEmptySyncPayload(), 200, `"${serverRevision}"`);
+      }
+      if (path === '/sync/watch') {
+        const known = (init?.headers as Record<string, string>)['If-None-Match'];
+        watches.push({ known, signal: init?.signal });
+        if (watches.length === 1) {
+          // 첫 대기 중에 다른 기기가 push 했다.
+          serverRevision = 10;
+        }
+        if (known !== `"${serverRevision}"`) {
+          return createJsonResponse({ revision: serverRevision }, 200, `"${serverRevision}"`);
+        }
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+        });
+      }
+      throw new Error(`unexpected fetch path: ${path}`);
+    });
+
+    const appStateSpy = jest.spyOn(AppState, 'addEventListener');
+    await act(async () => {
+      resetStore({
+        auth: createAuthenticatedState(session),
+        vault: { status: 'legacy', epoch: 0, migrationRequired: false },
+      });
+      await useMobileAppStore.getState().syncNow();
+    });
+    const onAppStateChange = appStateSpy.mock.calls.find(
+      ([event]) => event === 'change',
+    )?.[1] as ((state: string) => void) | undefined;
+    expect(onAppStateChange).toBeDefined();
+    const pullsBeforeForeground = pulls;
+
+    await act(async () => {
+      onAppStateChange?.('active');
+    });
+
+    // 첫 대기는 마지막으로 적용한 리비전(9)을 들고 간다. 바뀌었다는 답에 당기고 나면, 다음
+    // 대기는 새 리비전(10)을 들고 가서 붙잡힌다.
+    for (let attempt = 0; attempt < 400; attempt += 1) {
+      if (watches.some(watch => watch.known === '"10"')) {
+        break;
+      }
+      await act(async () => {
+        await new Promise(resolve => setTimeout(resolve, 10));
+      });
+    }
+    expect(watches[0].known).toBe('"9"');
+    expect(watches[watches.length - 1].known).toBe('"10"');
+    expect(pulls).toBeGreaterThan(pullsBeforeForeground);
+    expect(useMobileAppStore.getState().syncStatus.status).toBe('ready');
+
+    const waiting = watches[watches.length - 1];
+    expect(waiting.signal?.aborted).toBe(false);
+    await act(async () => {
+      onAppStateChange?.('background');
+    });
+    expect(waiting.signal?.aborted).toBe(true);
+    appStateSpy.mockRestore();
+  });
+
+  // 서버를 옛 버전으로 되돌리면 /sync/watch 가 404 다. 일시 오류로 보면 2초·5초… 뒤 대기만 다시
+  // 두드리며 그동안 아무것도 당기지 않는다. 옛 서버처럼 30초 폴링으로 물러서야 한다.
+  it('falls back to 30s polling when the server does not know the watch', async () => {
+    const keyBase64 = Buffer.alloc(32, 3).toString('base64');
+    const session = createLegacyAuthSession(keyBase64);
+    let watches = 0;
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      if (path === '/api/info') {
+        return createJsonResponse({
+          serverVersion: 'test',
+          capabilities: {
+            sync: { awsProfiles: true, watch: true },
+            sessions: { awsSsm: true },
+            vault: { e2ee: true },
+          },
+        });
+      }
+      if (path === '/sync' && init?.method !== 'POST') {
+        return createJsonResponse(buildEmptySyncPayload(), 200, '"9"');
+      }
+      if (path === '/sync/watch') {
+        watches += 1;
+        return createJsonResponse({ error: 'not found' }, 404);
+      }
+      throw new Error(`unexpected fetch path: ${path}`);
+    });
+
+    const appStateSpy = jest.spyOn(AppState, 'addEventListener');
+    await act(async () => {
+      resetStore({
+        auth: createAuthenticatedState(session),
+        vault: { status: 'legacy', epoch: 0, migrationRequired: false },
+      });
+      await useMobileAppStore.getState().syncNow();
+    });
+    const onAppStateChange = appStateSpy.mock.calls.find(
+      ([event]) => event === 'change',
+    )?.[1] as ((state: string) => void) | undefined;
+    expect(onAppStateChange).toBeDefined();
+
+    await act(async () => {
+      onAppStateChange?.('active');
+    });
+    // 오류로 봤다면 늦어도 2.4초(2초 ±20%) 안에 대기를 다시 두드린다. 그보다 길게 지켜본다.
+    for (let attempt = 0; attempt < 13; attempt += 1) {
+      await act(async () => {
+        await new Promise(resolve => setTimeout(resolve, 200));
+      });
+    }
+    expect(watches).toBe(1);
+    expect(useMobileAppStore.getState().syncStatus.status).toBe('ready');
+
+    await act(async () => {
+      onAppStateChange?.('background');
+    });
+    appStateSpy.mockRestore();
+  });
+
   it('pushes the outbox before pulling so an offline edit is not overwritten', async () => {
     // 앱을 켜 둔 채 네트워크가 돌아오면 30초 폴링이 pull 만 했다 — 큐는 영영 안 밀리고,
     // 화면은 "동기화 최신" 이라고 말하면서 대기 건수만 남았다. 더 나쁜 것은 순서다:

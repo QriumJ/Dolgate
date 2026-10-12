@@ -17,6 +17,8 @@ import {
   resetClientInstallationIdCacheForTests,
   saveStoredAuthSession,
   putVaultRewrap,
+  watchSyncChanges,
+  ApiError,
 } from '../src/lib/mobile';
 
 jest.mock('@react-native-async-storage/async-storage', () => ({
@@ -366,5 +368,110 @@ describe('sync snapshot payload shape', () => {
     expect(
       (snapshot.payload as unknown as Record<string, unknown[]>).somethingNewer,
     ).toHaveLength(1);
+  });
+});
+
+// 다른 기기의 변경을 기다리는 요청(GET /sync/watch). 서버는 바뀌면 그 순간 200, 아니면 대기가
+// 끝나 304 로 답한다.
+describe('watchSyncChanges', () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  function stubWatchResponse(response: {
+    status: number;
+    etag?: string;
+    body?: unknown;
+  }) {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = jest.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(url), init });
+      return {
+        ok: response.status >= 200 && response.status < 300,
+        status: response.status,
+        headers: {
+          get: (name: string) =>
+            name.toLowerCase() === 'etag' ? (response.etag ?? null) : null,
+        },
+        json: async () => response.body ?? {},
+        text: async () => JSON.stringify(response.body ?? {}),
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+    return calls;
+  }
+
+  it('waits with the last applied revision and reports no change on 304', async () => {
+    const calls = stubWatchResponse({ status: 304 });
+
+    const result = await watchSyncChanges(
+      'https://ssh.doldolma.com',
+      'access-token',
+      '"5"',
+      new AbortController().signal,
+    );
+
+    expect(result).toEqual({ changed: false, etag: '"5"' });
+    expect(calls[0].url).toBe('https://ssh.doldolma.com/sync/watch');
+    const headers = calls[0].init?.headers as Record<string, string>;
+    expect(headers['If-None-Match']).toBe('"5"');
+    expect(headers.authorization).toBe('Bearer access-token');
+  });
+
+  it('reports the new revision when it changed', async () => {
+    stubWatchResponse({ status: 200, etag: '"6"', body: { revision: 6 } });
+
+    await expect(
+      watchSyncChanges(
+        'https://ssh.doldolma.com',
+        'access-token',
+        '"5"',
+        new AbortController().signal,
+      ),
+    ).resolves.toEqual({ changed: true, etag: '"6"' });
+  });
+
+  it('throws an ApiError with the status on failure', async () => {
+    stubWatchResponse({ status: 401, body: { error: 'unauthorized' } });
+
+    const failure = await watchSyncChanges(
+      'https://ssh.doldolma.com',
+      'access-token',
+      '"5"',
+      new AbortController().signal,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ApiError);
+    expect((failure as ApiError).status).toBe(401);
+  });
+
+  // 앱이 백그라운드로 가면 대기 루프가 멈추며 신호를 abort 한다 — 요청도 같이 끊겨야 한다.
+  it('aborts the request when the caller stops waiting', async () => {
+    const calls = stubWatchResponse({ status: 304 });
+    const controller = new AbortController();
+
+    await watchSyncChanges(
+      'https://ssh.doldolma.com',
+      'access-token',
+      null,
+      controller.signal,
+    );
+    const requestSignal = calls[0].init?.signal as AbortSignal;
+    expect(requestSignal.aborted).toBe(false);
+    expect(
+      (calls[0].init?.headers as Record<string, string>)['If-None-Match'],
+    ).toBeUndefined();
+
+    const pending = stubWatchResponse({ status: 304 });
+    const stopped = new AbortController();
+    stopped.abort();
+    await watchSyncChanges(
+      'https://ssh.doldolma.com',
+      'access-token',
+      '"5"',
+      stopped.signal,
+    );
+    expect((pending[0].init?.signal as AbortSignal).aborted).toBe(true);
   });
 });

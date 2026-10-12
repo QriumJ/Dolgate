@@ -19,6 +19,7 @@ export * from "./port-forward-internal";
 export * from "./rdp-drives";
 export * from "./server-url";
 export * from "./subshell-detect";
+export * from "./sync-watch";
 export * from "./terminal-autocomplete";
 export * from "./aux-path";
 export * from "./command-spec/dynamic";

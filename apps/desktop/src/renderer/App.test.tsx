@@ -300,6 +300,7 @@ function createDolsshApi(options: {
   authBootstrapState?: any;
   authGetStateState?: any;
   syncBootstrapError?: Error | null;
+  syncWatch?: () => Promise<any>;
   includeSessionShareChatEvent?: boolean;
 }) {
   const listeners = {
@@ -386,6 +387,8 @@ function createDolsshApi(options: {
               errorMessage: null,
             })
           : vi.fn().mockRejectedValue(options.syncBootstrapError),
+      // 기본은 끝나지 않는 대기 — 변경을 기다리기만 하고 아무것도 당기지 않는다.
+      watch: vi.fn(options.syncWatch ?? (() => new Promise(() => undefined))),
     },
     updater: {
       getState: vi.fn().mockResolvedValue({
@@ -488,6 +491,124 @@ describe('App integration', () => {
       expect(api.sync.bootstrap).toHaveBeenCalledTimes(1);
       expect(mocks.storeState.refreshSyncedWorkspaceData).toHaveBeenCalledTimes(1);
       expect(screen.getByTestId('terminal-workspace')).toBeInTheDocument();
+    });
+  });
+
+  describe('다른 기기 변경 대기', () => {
+    const unlockedState = {
+      status: 'authenticated',
+      session: { user: { id: 'user-1', email: 'user@example.com' } },
+      vault: { status: 'unlocked' },
+      offline: null,
+      errorMessage: null,
+    };
+
+    function renderWithWatch(syncWatch: () => Promise<any>) {
+      const api = createDolsshApi({
+        authBootstrapState: unlockedState,
+        authGetStateState: unlockedState,
+        syncWatch,
+      });
+      Object.defineProperty(window, 'dolssh', {
+        configurable: true,
+        writable: true,
+        value: api,
+      });
+      mocks.desktopApi = api;
+      render(<App />);
+      return api;
+    }
+
+    async function waitForHydration(api: any) {
+      await waitFor(() => {
+        expect(api.sync.bootstrap).toHaveBeenCalledTimes(1);
+        expect(mocks.storeState.refreshSyncedWorkspaceData).toHaveBeenCalledTimes(1);
+        expect(api.sync.watch).toHaveBeenCalled();
+      });
+    }
+
+    it('서버가 바뀌었다고 하면 그 순간 당긴다', async () => {
+      let reportChange: (result: any) => void = () => undefined;
+      const api = renderWithWatch(
+        vi
+          .fn()
+          .mockImplementationOnce(
+            () =>
+              new Promise((resolve) => {
+                reportChange = resolve;
+              }),
+          )
+          .mockImplementation(() => new Promise(() => undefined)),
+      );
+      await waitForHydration(api);
+
+      await act(async () => {
+        reportChange({ outcome: 'changed', live: true });
+      });
+
+      await waitFor(() => {
+        expect(api.sync.bootstrap).toHaveBeenCalledTimes(2);
+        // 당긴 뒤에는 다시 기다린다.
+        expect(api.sync.watch).toHaveBeenCalledTimes(2);
+      });
+    });
+
+    it('변경이 없으면 당기지 않는다', async () => {
+      let reportNothing: (result: any) => void = () => undefined;
+      const api = renderWithWatch(
+        vi
+          .fn()
+          .mockImplementationOnce(
+            () =>
+              new Promise((resolve) => {
+                reportNothing = resolve;
+              }),
+          )
+          .mockImplementation(() => new Promise(() => undefined)),
+      );
+      await waitForHydration(api);
+
+      await act(async () => {
+        reportNothing({ outcome: 'unchanged', live: true });
+      });
+
+      // 1초 안에 돌아온 '변경 없음' 이라 루프가 물러서지만, 어느 쪽이든 당기지는 않는다.
+      expect(api.sync.bootstrap).toHaveBeenCalledTimes(1);
+    });
+
+    // 롱폴링 중이면 이미 변경을 기다리고 있다 — 창 포커스마다 당기면 요청만 는다.
+    it('롱폴링 중에는 창 포커스로 당기지 않는다', async () => {
+      const api = renderWithWatch(
+        vi
+          .fn()
+          .mockResolvedValueOnce({ outcome: 'unchanged', live: true })
+          .mockImplementation(() => new Promise(() => undefined)),
+      );
+      await waitForHydration(api);
+
+      await act(async () => {
+        window.dispatchEvent(new Event('focus'));
+      });
+
+      // 포커스는 물러서 있던 루프를 바로 다시 붙게 할 뿐이다.
+      await waitFor(() => {
+        expect(api.sync.watch).toHaveBeenCalledTimes(2);
+      });
+      expect(api.sync.bootstrap).toHaveBeenCalledTimes(1);
+    });
+
+    // 서버가 대기를 모르거나 아직 모르면 예전처럼 포커스 때 당긴다.
+    it('롱폴링이 아니면 창 포커스 때 당긴다', async () => {
+      const api = renderWithWatch(() => new Promise(() => undefined));
+      await waitForHydration(api);
+
+      await act(async () => {
+        window.dispatchEvent(new Event('focus'));
+      });
+
+      await waitFor(() => {
+        expect(api.sync.bootstrap).toHaveBeenCalledTimes(2);
+      });
     });
   });
 

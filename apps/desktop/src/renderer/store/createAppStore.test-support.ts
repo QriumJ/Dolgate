@@ -248,6 +248,7 @@ export function createMockApi(): DesktopApi {
         pendingPush: false,
         errorMessage: null,
       }),
+      watch: vi.fn(() => new Promise(() => undefined)),
       pushDirty: vi.fn().mockResolvedValue({
         status: "ready",
         lastSuccessfulSyncAt: "2025-01-01T00:00:00.000Z",

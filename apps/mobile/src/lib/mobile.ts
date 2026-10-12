@@ -43,6 +43,7 @@ import {
   projectSecretMetadata,
   SYNC_DATA_FLOOR_HEADER,
   SYNC_DATA_FLOOR_LEGACY_INTOLERANT_KINDS,
+  SYNC_WATCH_CLIENT_TIMEOUT_MS,
   VAULT_EPOCH_HEADER,
   type HostSecretInput,
   type MobileSettings,
@@ -965,6 +966,53 @@ export async function fetchSyncSnapshot(
     (await response.json()) as Partial<SyncPayloadV2>,
   );
   return { notModified: false, payload, etag: response.headers.get('etag') };
+}
+
+/**
+ * 다른 기기의 변경을 기다린다(서버 GET /sync/watch, 롱폴링). 서버는 20~30초 안에 답한다 —
+ * 리비전이 바뀌면 그 순간 changed, 아니면 대기가 끝나 304(unchanged).
+ *
+ * 그보다 한참(45초) 늦으면 연결이 조용히 죽은 것으로 보고 끊는다. signal 이 abort 되면(앱이
+ * 백그라운드로 가는 등) 바로 끊는다. fetchWithOptions 는 타임아웃을 걸면 호출자의 signal 을
+ * 덮어써 이 둘을 같이 못 하므로 직접 묶는다.
+ */
+export async function watchSyncChanges(
+  serverUrl: string,
+  accessToken: string,
+  ifNoneMatch: string | null,
+  signal: AbortSignal,
+): Promise<{ changed: boolean; etag: string | null }> {
+  const headers: Record<string, string> = {
+    authorization: `Bearer ${accessToken}`,
+    ...(await buildClientIdentificationHeaders()),
+  };
+  if (ifNoneMatch) {
+    headers['If-None-Match'] = ifNoneMatch;
+  }
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (signal.aborted) {
+    abort();
+  } else {
+    signal.addEventListener('abort', abort);
+  }
+  const timer = setTimeout(abort, SYNC_WATCH_CLIENT_TIMEOUT_MS);
+  try {
+    const response = await fetch(
+      new URL('/sync/watch', normalizeServerUrl(serverUrl)).toString(),
+      { headers, signal: controller.signal },
+    );
+    if (response.status === 304) {
+      return { changed: false, etag: ifNoneMatch };
+    }
+    if (!response.ok) {
+      throw await toApiError(response);
+    }
+    return { changed: true, etag: response.headers.get('etag') };
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener('abort', abort);
+  }
 }
 
 export async function fetchServerInfo(

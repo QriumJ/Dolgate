@@ -97,6 +97,10 @@ export function bootstrapSync() {
   return desktopApi.sync.bootstrap();
 }
 
+export function watchSync() {
+  return desktopApi.sync.watch();
+}
+
 export function pushDirtySync() {
   return desktopApi.sync.pushDirty();
 }

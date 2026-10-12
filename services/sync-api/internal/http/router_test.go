@@ -600,6 +600,7 @@ func TestServerInfoEndpoint(t *testing.T) {
 		Capabilities  struct {
 			Sync struct {
 				AWSProfiles bool `json:"awsProfiles"`
+				Watch       bool `json:"watch"`
 			} `json:"sync"`
 			Sessions struct {
 				AWSSsm            bool `json:"awsSsm"`
@@ -616,6 +617,10 @@ func TestServerInfoEndpoint(t *testing.T) {
 	}
 	if !response.Capabilities.Sync.AWSProfiles {
 		t.Fatalf("expected awsProfiles capability to be enabled")
+	}
+	// 클라이언트는 이 값이 있어야 롱폴링을 쓰고, 없으면 30초 폴링으로 물러선다.
+	if !response.Capabilities.Sync.Watch {
+		t.Fatalf("expected sync watch capability to be advertised")
 	}
 	if !response.Capabilities.Sessions.AWSSsm {
 		t.Fatalf("expected awsSsm capability to be enabled")

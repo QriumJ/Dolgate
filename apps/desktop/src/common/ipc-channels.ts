@@ -22,6 +22,7 @@ export const ipcChannels = {
   },
   sync: {
     bootstrap: 'sync:bootstrap',
+    watch: 'sync:watch',
     pushDirty: 'sync:push-dirty',
     status: 'sync:status',
     exportDecryptedSnapshot: 'sync:export-decrypted-snapshot'

@@ -1689,6 +1689,28 @@ func (s *GormStore) GetSyncGate(ctx context.Context, userID string) (SyncGate, e
 	return SyncGate{Exists: true, DataFloor: row.SyncDataFloor, Revision: row.SyncRevision}, nil
 }
 
+// syncRevisionBatchSize 는 GetSyncRevisions 가 IN 목록 하나에 담는 사용자 수다. 드라이버마다
+// 바인드 변수 상한이 달라(옛 SQLite 는 999) 넉넉히 아래로 잡는다.
+const syncRevisionBatchSize = 500
+
+// GetSyncRevisions 는 롱폴링 묶음 확인이 대기 중인 사용자들의 리비전을 한 번에 읽는 길이다.
+// 대기자마다 따로 읽으면 대기자 수만큼 왕복이 곱해진다.
+func (s *GormStore) GetSyncRevisions(ctx context.Context, userIDs []string) (map[string]int64, error) {
+	revisions := make(map[string]int64, len(userIDs))
+	for start := 0; start < len(userIDs); start += syncRevisionBatchSize {
+		end := min(start+syncRevisionBatchSize, len(userIDs))
+		var rows []userRow
+		err := s.db.WithContext(ctx).Select("id", "sync_revision").Where("id IN ?", userIDs[start:end]).Find(&rows).Error
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range rows {
+			revisions[row.ID] = row.SyncRevision
+		}
+	}
+	return revisions, nil
+}
+
 // DeleteUserData 는 회원 탈퇴용으로 사용자의 모든 행을 단일 트랜잭션으로 hard delete 한다.
 // sync_records 는 soft-delete 표시(deleted_at)와 무관하게 행 자체를 지운다("흔적 없이").
 func (s *GormStore) DeleteUserData(ctx context.Context, userID string) error {

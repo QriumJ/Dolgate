@@ -1008,6 +1008,62 @@ func TestSyncSnapshotIsolationKeepsRevisionAndRecordsTogether(t *testing.T) {
 	}
 }
 
+// 롱폴링 묶음 확인은 대기자 리비전을 한 번에 읽는다. IN 목록을 나눠 읽는 경계에서 사용자를
+// 빠뜨리면 그 사용자는 다른 서버로 들어온 변경을 대기 시간 끝까지 모른다.
+func TestGormStoreGetSyncRevisionsReadsAcrossBatches(t *testing.T) {
+	for _, testCase := range storeTestCases() {
+		t.Run(testCase.name, func(t *testing.T) {
+			store := testCase.open(t)
+			ctx := context.Background()
+
+			first, err := store.CreateUser(ctx, "revisions-first@example.com", "hash")
+			if err != nil {
+				t.Fatalf("CreateUser() error = %v", err)
+			}
+			second, err := store.CreateUser(ctx, "revisions-second@example.com", "hash")
+			if err != nil {
+				t.Fatalf("CreateUser() error = %v", err)
+			}
+			vault, err := store.GetOrCreateUserVaultKey(ctx, second.ID)
+			if err != nil {
+				t.Fatalf("GetOrCreateUserVaultKey() error = %v", err)
+			}
+			pushed, err := store.ApplyPushRecords(ctx, second.ID, syncmodel.Payload{
+				syncmodel.KindHosts: []syncmodel.Record{{
+					ID:               "revisions-host",
+					EncryptedPayload: "ciphertext",
+					UpdatedAt:        "2026-10-12T00:00:00Z",
+				}},
+			}, VaultPushFence{Epoch: vault.Epoch, Version: 1})
+			if err != nil {
+				t.Fatalf("ApplyPushRecords() error = %v", err)
+			}
+
+			// 진짜 사용자를 첫 묶음 맨 앞과 두 번째 묶음 한가운데에 둔다. 나머지는 없는 사용자다.
+			userIDs := make([]string, 0, 3*syncRevisionBatchSize)
+			for i := 0; i < cap(userIDs); i++ {
+				userIDs = append(userIDs, fmt.Sprintf("missing-%d", i))
+			}
+			userIDs[0] = first.ID
+			userIDs[syncRevisionBatchSize+syncRevisionBatchSize/2] = second.ID
+
+			revisions, err := store.GetSyncRevisions(ctx, userIDs)
+			if err != nil {
+				t.Fatalf("GetSyncRevisions() error = %v", err)
+			}
+			if len(revisions) != 2 {
+				t.Fatalf("expected only the two real users, got %d entries", len(revisions))
+			}
+			if revision, ok := revisions[first.ID]; !ok || revision != 0 {
+				t.Fatalf("first user revision = %d, %v", revision, ok)
+			}
+			if revision, ok := revisions[second.ID]; !ok || revision != pushed {
+				t.Fatalf("second user revision = %d, %v (pushed %d)", revision, ok, pushed)
+			}
+		})
+	}
+}
+
 // 게이트는 users 행 한 번으로 존재·하한·리비전을 읽는다. 리비전은 GET /sync 가 레코드를 읽기
 // 전에 304 를 판정하는 근거라, push 마다 스냅샷이 주는 값과 같이 올라가야 한다.
 func TestGormStoreSyncGateReadsExistenceFloorAndRevision(t *testing.T) {

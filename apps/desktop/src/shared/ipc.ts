@@ -116,7 +116,7 @@ import type {
   WarpgateImportEvent,
   WarpgateTargetSummary,
 } from "@dolssh/shared-core";
-import type { SyncPayloadV2 } from "@dolssh/shared-core";
+import type { SyncPayloadV2, SyncWatchResult } from "@dolssh/shared-core";
 import type {
   AiApiKeyStatus,
   AiApprovalResponse,
@@ -1305,6 +1305,11 @@ export interface DesktopApi {
   };
   sync: {
     bootstrap: () => Promise<SyncStatus>;
+    /**
+     * 다른 기기의 변경을 기다린다(서버 롱폴링). 'changed' 면 지금 bootstrap 으로 당긴다.
+     * 서버가 대기를 모르면 30초마다 'changed' 가 온다(live: false).
+     */
+    watch: () => Promise<SyncWatchResult>;
     pushDirty: () => Promise<SyncStatus>;
     status: () => Promise<SyncStatus>;
     exportDecryptedSnapshot: () => Promise<SyncPayloadV2>;

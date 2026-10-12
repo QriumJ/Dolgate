@@ -94,6 +94,12 @@ import {
   resolveVaultDescriptorState,
   unwrapVaultDek,
   wrapVaultDek,
+  abortableSleep,
+  startSyncWatchLoop,
+  SYNC_WATCH_FALLBACK_POLL_MS,
+  type ServerInfoResponse,
+  type SyncWatchLoop,
+  type SyncWatchOutcome,
 } from '@dolssh/shared-core';
 import { fromByteArray, toByteArray } from 'base64-js';
 import {
@@ -126,6 +132,7 @@ import {
   fetchExchangeSession,
   fetchServerInfo,
   fetchSyncSnapshot,
+  watchSyncChanges,
   getSettingsValidationMessage,
   clearStoredVaultDek,
   loadStoredAwsProfiles,
@@ -1237,8 +1244,11 @@ let lastSyncRevision: string | null = null;
 // 값을 캡처하고, 완료 시 달라져 있으면 결과를 버린다 — 잠긴 상태에서 시작된 sync 가
 // 방금 잠금해제/재설정된 상태를 덮어쓰는 레이스를 막는다.
 let vaultSyncGeneration = 0;
-// 30초 폴링 타이머 + 포그라운드 리스너 정리 함수.
-let syncPollTimer: ReturnType<typeof setInterval> | null = null;
+// 다른 기기의 변경을 기다리는 루프(포그라운드에서만 돈다) + 포그라운드 리스너 정리 함수.
+let syncWatchLoop: SyncWatchLoop | null = null;
+// 서버가 변경 대기(GET /sync/watch)를 지원하는가 — 서버 URL 별로 기억한다. 동기화 때 읽는
+// /api/info 로 알게 되고, 대기 요청이 404 등을 받으면 지원하지 않는 것으로 바꾼다.
+let syncWatchSupport: { serverUrl: string; supported: boolean } | null = null;
 let appStateSubscription: { remove: () => void } | null = null;
 let pendingServerKeyResolver: ((accepted: boolean) => void) | null = null;
 let pendingCredentialResolver:
@@ -1362,10 +1372,8 @@ function getTailnetFailureMessage(
 }
 
 function stopSyncPolling(): void {
-  if (syncPollTimer) {
-    clearInterval(syncPollTimer);
-    syncPollTimer = null;
-  }
+  syncWatchLoop?.stop();
+  syncWatchLoop = null;
 }
 
 // pull 을 돌려도 되는 상태인지 — 인증 + 볼트가 잠금해제(v2) 또는 legacy(v1, 세션 키로 동기화
@@ -1379,21 +1387,114 @@ function shouldPollSync(
   );
 }
 
+// 다른 기기의 변경을 기다리다 바뀌면 당긴다(서버 롱폴링). 서버가 대기를 모르면 30초마다
+// 당긴다 — 롱폴링 이전과 같다.
 function startSyncPolling(): void {
-  if (syncPollTimer) {
+  if (syncWatchLoop) {
     return;
   }
-  syncPollTimer = setInterval(() => {
-    const state = useMobileAppStore.getState();
-    // 중복은 syncWithSession 의 syncPromise 가이드가 막는다.
-    if (shouldPollSync(state)) {
-      void state.syncNow().catch(() => undefined);
-    }
-  }, 30_000);
+  syncWatchLoop = startSyncWatchLoop({
+    watch: watchForSyncChanges,
+    onChange: async () => {
+      const state = useMobileAppStore.getState();
+      if (!shouldPollSync(state)) {
+        return true;
+      }
+      // 중복은 syncWithSession 의 syncPromise 가이드가 막는다. 오류는 syncStatus 에 남는다.
+      await state.syncNow().catch(() => undefined);
+      return useMobileAppStore.getState().syncStatus.status === 'ready';
+    },
+  });
 }
 
-// 폴링 라이프사이클을 앱 수명 동안 한 번 설정한다: 포그라운드 복귀 시 즉시 pull + 30초
-// 주기 시작, 백그라운드로 가면 타이머 정지(배터리). 조건부 GET(ETag)이라 변경 없으면 304.
+function noteSyncWatchSupport(
+  serverUrl: string,
+  info: ServerInfoResponse | 'unsupported' | null,
+): void {
+  if (info === null) {
+    return;
+  }
+  syncWatchSupport = {
+    serverUrl,
+    supported: info !== 'unsupported' && info.capabilities?.sync?.watch === true,
+  };
+}
+
+async function resolveSyncWatchSupport(serverUrl: string): Promise<boolean> {
+  if (syncWatchSupport?.serverUrl !== serverUrl) {
+    // /api/info 가 아예 없는 서버는 확실한 구버전이다. 그 밖의 실패는 모르는 채로 둔다.
+    const info = await fetchServerInfo(serverUrl).catch(error =>
+      error instanceof ApiError &&
+      [404, 405, 501].includes(error.status ?? 0)
+        ? ('unsupported' as const)
+        : null,
+    );
+    noteSyncWatchSupport(serverUrl, info);
+  }
+  return (
+    syncWatchSupport?.serverUrl === serverUrl && syncWatchSupport.supported
+  );
+}
+
+/**
+ * 한 번 기다린다 — 대기 루프의 watch.
+ *
+ * - 당길 수 없는 상태(로그아웃·잠김)면 요청 없이 쉬었다 'unchanged'.
+ * - 서버가 대기를 모르거나 아직 모르면 30초 쉬었다 'changed'(예전 30초 폴링과 같다).
+ * - 401 이면 'changed' — 당기기(syncNow)가 토큰을 갱신한다.
+ * - 서버가 대기를 모른다고 하면(404 등) 옛 서버처럼 30초 폴링으로 물러선다.
+ */
+async function watchForSyncChanges(
+  signal: AbortSignal,
+): Promise<SyncWatchOutcome> {
+  const state = useMobileAppStore.getState();
+  const session = state.auth.session;
+  const serverUrl = state.settings.serverUrl;
+  if (!session || !shouldPollSync(state)) {
+    await abortableSleep(SYNC_WATCH_FALLBACK_POLL_MS, signal).catch(
+      () => undefined,
+    );
+    return 'unchanged';
+  }
+  if (!(await resolveSyncWatchSupport(serverUrl))) {
+    await abortableSleep(SYNC_WATCH_FALLBACK_POLL_MS, signal);
+    return 'changed';
+  }
+  try {
+    const result = await watchSyncChanges(
+      serverUrl,
+      session.tokens.accessToken,
+      lastSyncRevision,
+      signal,
+    );
+    if (!result.changed) {
+      return 'unchanged';
+    }
+    // 이미 그 리비전을 적용했다면(자기 push 의 메아리) 당길 것이 없다.
+    return result.etag !== null && result.etag === lastSyncRevision
+      ? 'unchanged'
+      : 'changed';
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 401) {
+      return 'changed';
+    }
+    if (
+      error instanceof ApiError &&
+      [404, 405, 501].includes(error.status ?? 0)
+    ) {
+      // 서버가 대기를 모른다 — 옛 버전으로 되돌려졌다. 재시도만 하면 그동안 아무것도 당기지
+      // 않는다. 옛 서버처럼 30초 폴링으로 물러선다. 당길 때 /api/info 를 다시 읽으므로 서버가
+      // 다시 올라오면 롱폴링으로 돌아온다.
+      syncWatchSupport = { serverUrl, supported: false };
+      await abortableSleep(SYNC_WATCH_FALLBACK_POLL_MS, signal);
+      return 'changed';
+    }
+    throw error;
+  }
+}
+
+// 동기화 라이프사이클을 앱 수명 동안 한 번 설정한다: 포그라운드 복귀 시 즉시 pull + 변경 대기
+// 시작, 백그라운드로 가면 대기를 끊는다(배터리 — iOS 는 어차피 앱을 멈춘다).
 function ensureSyncPollingLifecycle(): void {
   if (!appStateSubscription) {
     appStateSubscription = AppState.addEventListener('change', nextState => {
@@ -7171,6 +7272,7 @@ export const useMobileAppStore = create<MobileAppState>()(
               }
             }
             const serverInfo = await serverInfoPromise;
+            noteSyncWatchSupport(get().settings.serverUrl, serverInfo);
 
             // 당기기가 성공했다고 **밀 것이 없어진 것은 아니다.** 아웃박스에 남아 있으면
             // pendingPush 를 그대로 세워 둔다 — 여기서 false 로 덮으면 올라가지 않은 변경이
@@ -10947,6 +11049,7 @@ export function resetMobileStoreRuntimeForTests(): void {
   lastSyncRevision = null;
   vaultSyncGeneration = 0;
   stopSyncPolling();
+  syncWatchSupport = null;
   if (appStateSubscription) {
     appStateSubscription.remove();
     appStateSubscription = null;

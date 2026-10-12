@@ -41,6 +41,11 @@ type RouterConfig struct {
 	AwsSftpBridge      *AwsSftpBridge
 	AwsSshTunnelRelay  *AwsSshTunnelRelay
 	AwsSsoMobile       *AwsSsoMobileManager
+	// SyncWatch 는 GET /sync/watch 대기자 묶음이다. 서버 종료 때 Close 해야 하므로 main 이
+	// 만들어 넘긴다. nil 이면 라우터가 하나 만든다(테스트).
+	SyncWatch *SyncWatchHub
+	// SyncWatchHold 는 GET /sync/watch 의 대기 시간이다. 0 이면 기본값(25초 안팎). 테스트용.
+	SyncWatchHold time.Duration
 }
 
 type awsSsoMobileRuntimeState struct {
@@ -100,6 +105,9 @@ type serverInfoSyncCapabilities struct {
 	// 버전 문자열이 아니라 플래그인 이유: 자체 호스팅 서버는 버전 체계가 다를 수 있고,
 	// awsProfiles·e2ee·webauthn 도 같은 방식으로 알린다.
 	DataFloor bool `json:"dataFloor"`
+	// watch: 변경 대기(GET /sync/watch, 롱폴링)를 지원하는가. 없으면 클라이언트는 30초 폴링으로
+	// 물러선다.
+	Watch bool `json:"watch"`
 }
 
 type serverInfoVaultCapabilities struct {
@@ -401,6 +409,13 @@ func syncRevisionETag(revision int64) string {
 	return fmt.Sprintf("\"%d\"", revision)
 }
 
+// respondSyncWatchChanged 는 GET /sync/watch 의 "바뀌었다" 응답이다. 리비전을 ETag 와 본문에
+// 같이 실어, 클라이언트가 이미 그 리비전을 적용했다면(자기 push 의 메아리) 당기지 않게 한다.
+func respondSyncWatchChanged(ctx *gin.Context, revision int64) {
+	ctx.Header("ETag", syncRevisionETag(revision))
+	ctx.JSON(http.StatusOK, gin.H{"revision": revision})
+}
+
 // 구버전 클라이언트에 v2 계정 세션을 거부할 때 내려주는 안내. 데스크톱의
 // normalizeAuthInvalidErrorMessage 치환 패턴(unauthorized|로그인이 필요|세션이 만료 등)에
 // 걸리지 않는 문구여야 원문 그대로 로그인 화면에 표시된다. 상태코드도 같은 이유로
@@ -551,6 +566,14 @@ func NewRouter(store store.Store, authService *auth.Service, config RouterConfig
 		awsSessionFactory = config.AwsSessionBridge.RunnerFactory()
 	}
 	awsSessionHub := NewAwsSessionHub(config.AwsSsmRuntime, awsSessionFactory)
+	syncWatch := config.SyncWatch
+	if syncWatch == nil {
+		syncWatch = NewSyncWatchHub(store, 0)
+	}
+	syncWatchHold := config.SyncWatchHold
+	if syncWatchHold <= 0 {
+		syncWatchHold = defaultSyncWatchHold
+	}
 	shareAssetHandler := http.StripPrefix("/share/assets/", http.FileServer(http.FS(mustShareAssetFS())))
 	authLimiters := newAuthRouteLimiters(config.RateLimit)
 
@@ -591,6 +614,7 @@ func NewRouter(store store.Store, authService *auth.Service, config RouterConfig
 				Sync: serverInfoSyncCapabilities{
 					AWSProfiles: true,
 					DataFloor:   true,
+					Watch:       true,
 				},
 				Sessions: serverInfoSessionCapabilities{
 					AWSSsm:            config.AwsSsmRuntime.Enabled,
@@ -1126,6 +1150,8 @@ func NewRouter(store store.Store, authService *auth.Service, config RouterConfig
 			logAndJSONError(ctx, http.StatusInternalServerError, "서버 오류가 발생했습니다.", err)
 			return
 		}
+		// 기다리던 다른 기기를 깨워 401 을 받게 한다 — 그래야 바로 로그아웃된다.
+		syncWatch.notify(userID)
 		ctx.Status(http.StatusNoContent)
 	})
 
@@ -1539,6 +1565,8 @@ func NewRouter(store store.Store, authService *auth.Service, config RouterConfig
 			logAndJSONError(ctx, http.StatusInternalServerError, "서버 오류가 발생했습니다.", err)
 			return
 		}
+		// 볼트 생성은 리비전을 올린다 — 기다리던 다른 기기가 새 볼트를 바로 알게 한다.
+		syncWatch.notify(userID)
 		// 방금 시작된 DEK 세대를 돌려줘 클라이언트가 세션 재갱신 없이 캐시하게 한다.
 		ctx.JSON(http.StatusOK, gin.H{"epoch": vault.Epoch, "wrapRevision": vault.WrapRevision})
 	})
@@ -1606,6 +1634,7 @@ func NewRouter(store store.Store, authService *auth.Service, config RouterConfig
 			logAndJSONError(ctx, http.StatusInternalServerError, "서버 오류가 발생했습니다.", err)
 			return
 		}
+		syncWatch.notify(userID)
 		ctx.JSON(http.StatusOK, gin.H{"epoch": epoch})
 	})
 
@@ -1684,6 +1713,60 @@ func NewRouter(store store.Store, authService *auth.Service, config RouterConfig
 		// 빈 kind 는 맵에 키가 없다. 이미 배포된 클라이언트를 위해 응답에서만 옛 모양
 		// (모든 레거시 kind 가 빈 배열로라도 존재)을 유지한다 — WithLegacyWireKinds 주석 참고.
 		ctx.JSON(http.StatusOK, payload.WithLegacyWireKinds())
+	})
+	// 변경 대기(롱폴링). 클라이언트는 마지막으로 적용한 리비전을 If-None-Match 로 보내고, 그것이
+	// 바뀌는 순간 {revision} 을 받는다. 바뀐 것이 없으면 대기 시간(25초 안팎)이 지나 304 로
+	// 끝나고, 클라이언트는 바로 다시 붙는다.
+	//
+	// 데이터는 주지 않는다 — 바뀌었다는 것만 알리고 실제 동기화는 GET /sync 가 한다. 그래야
+	// ETag·스냅샷 규칙이 한 곳에만 있다. 기다리는 동안 DB 연결도 잡지 않는다 — 리비전은 게이트가
+	// 이미 읽어 왔고, 깨어난 뒤에만 다시 읽는다.
+	//
+	// 게이트를 읽은 뒤 대기를 걸기 전 사이에 커밋된 push 는 그 순간의 알림을 놓치지만, 묶음
+	// 확인(SyncWatchHub)이 몇 초 안에 잡는다.
+	syncGroup.GET("/watch", func(ctx *gin.Context) {
+		userID := ctx.GetString("userId")
+		since := ctx.GetInt64(syncGateRevisionContextKey)
+		known := strings.TrimSpace(ctx.GetHeader("If-None-Match"))
+		if known != syncRevisionETag(since) {
+			respondSyncWatchChanged(ctx, since)
+			return
+		}
+
+		deadline := time.NewTimer(jitterSyncWatchHold(syncWatchHold))
+		defer deadline.Stop()
+		for {
+			changed, release := syncWatch.subscribe(userID, since)
+			woke := false
+			select {
+			case <-changed:
+				woke = true
+			case <-deadline.C:
+			case <-syncWatch.done():
+			case <-ctx.Request.Context().Done():
+			}
+			release()
+			if !woke {
+				ctx.Header("ETag", known)
+				ctx.Status(http.StatusNotModified)
+				return
+			}
+
+			gate, err := store.GetSyncGate(ctx.Request.Context(), userID)
+			if err != nil {
+				logAndJSONError(ctx, http.StatusInternalServerError, "서버 오류가 발생했습니다.", err)
+				return
+			}
+			if !gate.Exists {
+				ctx.JSON(http.StatusUnauthorized, gin.H{"error": "로그인이 필요합니다."})
+				return
+			}
+			if gate.Revision != since {
+				respondSyncWatchChanged(ctx, gate.Revision)
+				return
+			}
+			// 이 기기는 이미 그 리비전이다(다른 기기 몫의 신호). 남은 시간 동안 다시 기다린다.
+		}
 	})
 	syncGroup.POST("", func(ctx *gin.Context) {
 		userID := ctx.GetString("userId")
@@ -1777,6 +1860,8 @@ func NewRouter(store store.Store, authService *auth.Service, config RouterConfig
 			logAndJSONError(ctx, http.StatusInternalServerError, "서버 오류가 발생했습니다.", err)
 			return
 		}
+		// 커밋된 뒤에 깨운다. 기다리던 다른 기기가 바로 당겨 간다.
+		syncWatch.notify(userID)
 		// 새 revision 을 돌려줘 push 한 기기가 자기 push 를 다시 pull 하지 않게 한다.
 		ctx.JSON(http.StatusAccepted, gin.H{"revision": revision})
 	})

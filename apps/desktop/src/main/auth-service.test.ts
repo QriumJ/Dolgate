@@ -659,8 +659,27 @@ describe("AuthService offline bootstrap", () => {
 });
 
 describe("AuthService browser login recovery", () => {
+  // beginBrowserLogin 은 브라우저를 열기 전에 /api/info 로 서버가 계정을 담을 수 있는지 본다.
+  // 막아 두지 않으면 테스트가 실제 서버(ssh.doldolma.com)로 나가서, 그 주소가 응답하지 않는
+  // 환경에서는 5초 타임아웃으로 실패한다 — 결과가 네트워크에 달린다.
+  function stubCapableServerInfo() {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            serverVersion: "1.9.5",
+            capabilities: { sync: { dataFloor: true } },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      ),
+    );
+  }
+
   it("reopens browser login by reopening the same pending browser login URL", async () => {
     const { service } = await createService();
+    stubCapableServerInfo();
     const electron = await import("electron");
     const openExternal = vi.mocked(electron.shell.openExternal);
     openExternal.mockReset().mockResolvedValue(undefined);
@@ -678,6 +697,7 @@ describe("AuthService browser login recovery", () => {
 
   it("cancels the pending browser login and returns to unauthenticated", async () => {
     const { service } = await createService();
+    stubCapableServerInfo();
     const electron = await import("electron");
     vi.mocked(electron.shell.openExternal)
       .mockReset()

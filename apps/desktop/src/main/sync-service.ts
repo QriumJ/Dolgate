@@ -15,10 +15,12 @@ import type {
   SyncPayloadV2,
   SyncRecord,
   SyncStatus,
+  SyncWatchResult,
   TailnetPayload,
   TerminalPreferencesRecord,
 } from "@shared";
 import {
+  abortableSleep,
   formatSyncRevisionEtag,
   isKnownHostKind,
   collectGroupPaths,
@@ -33,6 +35,8 @@ import {
   SYNC_DATA_FLOOR_HEADER,
   SYNC_DATA_FLOOR_LEGACY_INTOLERANT_KINDS,
   LEGACY_TOLERATED_HOST_KINDS,
+  SYNC_WATCH_CLIENT_TIMEOUT_MS,
+  SYNC_WATCH_FALLBACK_POLL_MS,
   VAULT_EPOCH_HEADER,
 } from '@shared';
 import {
@@ -443,6 +447,12 @@ export class SyncService {
   // 마지막으로 서버와 맞춘 리비전(ETag). 폴링의 If-None-Match 로 보내 변경 없으면 304 로
   // 조기 종료한다. 프로세스 메모리에만 두고, 재시작 시 첫 부트스트랩이 전체를 받아 다시 채운다.
   private lastSyncRevision: string | null = null;
+  // 서버가 변경 대기(GET /sync/watch)를 지원하는가. /api/info 로 알게 되고, 서버 URL 이 바뀌면
+  // 다시 모르는 것으로 본다. 대기 요청이 404 등을 받으면 지원하지 않는 것으로 바꾼다.
+  private watchSupport: { serverUrl: string; supported: boolean } | null = null;
+  // 잠자기 복귀 때 진행 중인 대기를 끊는다 — 잠든 사이 죽은 연결을 45초 타임아웃까지 붙들고 있지
+  // 않게. 끊을 때마다 새로 만든다.
+  private watchInterrupt = new AbortController();
   private onAppliedSnapshot: (() => void | Promise<void>) | null = null;
   private onPurgedSyncedCache: (() => void | Promise<void>) | null = null;
 
@@ -726,6 +736,107 @@ export class SyncService {
     return this.state;
   }
 
+  /**
+   * 다른 기기의 변경을 기다린다 — 렌더러의 대기 루프(startSyncWatchLoop)가 부른다.
+   *
+   * 동기화 큐(enqueueSyncOperation) **밖**에서 돈다. 큐 안에서 25초를 기다리면 그동안 로컬 편집의
+   * 업로드(pushDirty)가 그 뒤에 막힌다. 여기서는 "바뀌었다" 만 알아내고, 당기는 것은 렌더러가
+   * 지금처럼 bootstrap 으로 한다.
+   *
+   * 서버가 대기를 모르거나(옛 자체 호스팅) 그 여부를 아직 모르면 30초 기다렸다 'changed' 를
+   * 돌려준다. 렌더러가 그대로 당기므로 예전 30초 폴링과 같다.
+   */
+  async watchForChanges(): Promise<SyncWatchResult> {
+    const interrupt = this.watchInterrupt.signal;
+    const lease = this.captureSyncLease();
+    const cancel = AbortSignal.any([lease.signal, interrupt]);
+    if (!this.canWatchForChanges()) {
+      // 지금은 당길 수 없다(로그아웃·잠김·오프라인 등). 요청 없이 쉬었다가 다시 묻게 한다.
+      return this.waitWithoutServer(cancel, 'unchanged');
+    }
+    if (!(await this.resolveWatchSupport(lease))) {
+      return this.waitWithoutServer(cancel, 'changed');
+    }
+
+    const known = this.lastSyncRevision;
+    // 서버가 이 기능을 모른다는 답 — /api/info 판정과 같은 코드들.
+    const unsupported = (status: number) => [404, 405, 501].includes(status);
+    let response: Response;
+    try {
+      response = await this.fetchWithAuthRetry(
+        lease,
+        new URL('/sync/watch', lease.serverUrl),
+        {
+          headers: known ? { 'If-None-Match': known } : {},
+          // 서버는 20~30초 안에 답한다. 그보다 한참 늦으면 연결이 조용히 죽은 것이다.
+          signal: AbortSignal.any([cancel, AbortSignal.timeout(SYNC_WATCH_CLIENT_TIMEOUT_MS)]),
+        },
+        t('sync.fetchFailed'),
+        unsupported,
+      );
+    } catch (error) {
+      if (interrupt.aborted || !this.isSyncLeaseActive(lease)) {
+        // 잠자기 복귀로 끊었거나 계정·볼트가 바뀌었다 — 바뀐 상태로 바로 다시 붙는다.
+        return { outcome: 'unchanged', live: true };
+      }
+      throw error;
+    }
+    if (response.status === 304) {
+      return { outcome: 'unchanged', live: true };
+    }
+    if (unsupported(response.status)) {
+      // 서버가 대기를 모른다 — 옛 버전으로 되돌려졌다. 일시 오류로 보고 재시도만 하면 그동안
+      // 아무것도 당기지 않는다. 옛 서버처럼 30초 폴링으로 물러선다. 당길 때 /api/info 를 다시
+      // 읽으므로 dataFloor 같은 다른 기능 정보도 갱신되고, 서버가 다시 올라오면 롱폴링으로 돌아온다.
+      this.watchSupport = { serverUrl: lease.serverUrl, supported: false };
+      await response.body?.cancel();
+      return this.waitWithoutServer(cancel, 'changed');
+    }
+    const etag = response.headers.get('etag');
+    await response.body?.cancel();
+    // 이미 그 리비전을 적용했다면(자기 push 의 메아리) 당길 것이 없다.
+    return {
+      outcome: etag !== null && etag === this.lastSyncRevision ? 'unchanged' : 'changed',
+      live: true,
+    };
+  }
+
+  /** 진행 중인 변경 대기를 끊는다 — 잠자기 복귀 때. 대기 루프는 바로 다시 붙는다. */
+  interruptWatch(): void {
+    this.watchInterrupt.abort();
+    this.watchInterrupt = new AbortController();
+  }
+
+  private canWatchForChanges(): boolean {
+    return (
+      !isE2ESyncDisabled() &&
+      this.authService.getState().status === 'authenticated' &&
+      this.authService.isVaultReadyForSync()
+    );
+  }
+
+  private async resolveWatchSupport(lease: SyncLease): Promise<boolean> {
+    if (this.watchSupport?.serverUrl !== lease.serverUrl) {
+      // /api/info 를 읽으면서 대기 지원 여부도 적어 둔다. 못 읽으면 모르는 채로 둔다(폴링으로 물러선다).
+      await this.fetchAwsProfilesServerSupport(lease).catch(() => undefined);
+    }
+    return (
+      this.watchSupport?.serverUrl === lease.serverUrl && this.watchSupport.supported
+    );
+  }
+
+  private async waitWithoutServer(
+    signal: AbortSignal,
+    outcome: SyncWatchResult['outcome'],
+  ): Promise<SyncWatchResult> {
+    try {
+      await abortableSleep(SYNC_WATCH_FALLBACK_POLL_MS, signal);
+    } catch {
+      // 잠자기 복귀·계정 변경이 깨웠다. 폴링 쪽이면 이때 바로 당기는 편이 낫다.
+    }
+    return { outcome, live: false };
+  }
+
   async pushDirty(): Promise<SyncStatus> {
     if (isE2ESyncDisabled()) {
       this.patchState({
@@ -921,18 +1032,21 @@ export class SyncService {
     url: URL,
     init: RequestInit,
     fallback: string,
+    // 오류로 던지지 않고 그대로 돌려받을 상태 — 호출자가 그 상태로 판정해야 할 때만 준다.
+    passthrough?: (status: number) => boolean,
   ): Promise<Response> {
     this.assertSyncLeaseActive(lease);
     let response = await fetch(
       url,
       this.withAccessToken(
-        { ...init, signal: lease.signal },
+        // 호출자가 신호를 주면(변경 대기의 타임아웃) 그것을 쓴다 — 그 신호도 lease.signal 을 묶어 둔다.
+        { ...init, signal: init.signal ?? lease.signal },
         lease.accessToken,
       ),
     );
     this.assertSyncLeaseActive(lease);
     // 304 Not Modified 는 조건부 GET 의 정상 결과(변경 없음)이므로 통과시킨다.
-    if (response.ok || response.status === 304) {
+    if (response.ok || response.status === 304 || passthrough?.(response.status)) {
       return response;
     }
     if (response.status === 409) {
@@ -954,12 +1068,12 @@ export class SyncService {
     response = await fetch(
       url,
       this.withAccessToken(
-        { ...init, signal: lease.signal },
+        { ...init, signal: init.signal ?? lease.signal },
         this.authService.getAccessToken(),
       ),
     );
     this.assertSyncLeaseActive(lease);
-    if (!response.ok && response.status !== 304) {
+    if (!response.ok && response.status !== 304 && !passthrough?.(response.status)) {
       if (response.status === 409) {
         throw await toConflictError(response, fallback);
       }
@@ -1466,6 +1580,7 @@ export class SyncService {
           this.authService.noteServerVaultSupport(false);
           this.authService.noteServerWebauthnSupport(false);
           this.authService.noteServerDataFloorSupport(false);
+          this.watchSupport = { serverUrl: lease.serverUrl, supported: false };
           return 'unsupported';
         }
         return this.state.awsProfilesServerSupport ?? 'unknown';
@@ -1484,6 +1599,10 @@ export class SyncService {
       this.authService.noteServerDataFloorSupport(
         serverInfo.capabilities?.sync?.dataFloor === true
       );
+      this.watchSupport = {
+        serverUrl: lease.serverUrl,
+        supported: serverInfo.capabilities?.sync?.watch === true,
+      };
       return resolveAwsProfilesServerSupport(serverInfo);
     } catch (error) {
       if (
