@@ -207,8 +207,46 @@ function shouldInstallPods() {
   return podfileLockContent !== readFileIfExists(manifestLockPath);
 }
 
+/**
+ * `.xcode.env.local` 의 Node 경로가 사라졌으면 지금 Node 로 다시 쓴다.
+ *
+ * 이 파일은 RN 의 `pod install` 이 **없을 때만** 만들고, 그때의 `node` 절대 경로를 적는다. Node 가
+ * 옮겨 가거나 지워지면(IDE 가 내려받은 Node 는 IDE 를 업데이트하면 폴더째 사라진다) 죽은 경로만
+ * 남아 Xcode 의 RN 스크립트 단계가 "No such file or directory" 로 멈춘다. 우리가 넘기는
+ * NODE_BINARY 환경 변수로는 못 막는다 — Xcode 가 이 파일을 나중에 읽어 덮어쓴다.
+ *
+ * 손으로 고치는 방법(파일을 지우고 `pod install`)과 같은 결과를 낸다. 경로가 살아 있거나 절대
+ * 경로가 아니면(`node` 처럼 PATH 에서 찾게 둔 것) 손대지 않는다.
+ */
+function repairStaleXcodeEnvLocal(env) {
+  const envLocalPath = path.join(iosRoot, ".xcode.env.local");
+  if (!fs.existsSync(envLocalPath)) {
+    // 없으면 `pod install` 이 만든다.
+    return;
+  }
+  // Xcode 와 같은 방식(셸로 source)으로 읽는다 — `$(command -v node)` 같은 값도 그대로 풀린다.
+  const result = spawnSync(
+    "/bin/sh",
+    ["-c", '. "$1" >/dev/null 2>&1; printf %s "$NODE_BINARY"', "sh", envLocalPath],
+    { env: { ...env, NODE_BINARY: "" }, encoding: "utf8", timeout: 10_000 },
+  );
+  const configured = result.stdout ?? "";
+  if (!path.isAbsolute(configured) || hasExecutable(configured)) {
+    return;
+  }
+
+  // RN 이 이 파일을 만들 때 쓰는 이스케이프(Shellwords.escape)와 같은 규칙이다.
+  const nodeBinary = process.execPath.replace(/[^A-Za-z0-9_\-.,:+/@]/g, "\\$&");
+  fs.writeFileSync(envLocalPath, `export NODE_BINARY=${nodeBinary}\n`);
+  console.log(
+    `.xcode.env.local 의 Node(${configured})가 없어서 지금 Node(${process.execPath})로 바꿨습니다.`,
+  );
+}
+
 function ensurePodsInstalled(env) {
   ensureCocoaPodsAvailable(env);
+  // `pod install` 은 이 파일을 새로 만들 때만 경로를 적으니, 있던 파일은 여기서 본다.
+  repairStaleXcodeEnvLocal(env);
   if (!shouldInstallPods()) {
     return;
   }
