@@ -1664,24 +1664,29 @@ func (s *GormStore) UserExists(ctx context.Context, userID string) (bool, error)
 	return count > 0, nil
 }
 
-// GetSyncGate 는 /sync 게이트가 필요한 두 값을 users 행 **한 번**으로 읽는다.
+// GetSyncGate 는 /sync 게이트가 필요한 값들을 users 행 **한 번**으로 읽는다.
 //
 // 존재 확인(탈퇴 차단)과 데이터 하한(구클라이언트 차단)은 같은 행에 있는데, 미들웨어가
 // 나뉘어 있어 폴링마다 같은 행을 두 번 왕복했다. 행이 없으면 탈퇴한 사용자이므로 존재
 // 확인은 이 조회에 공짜로 딸려 온다.
 //
-// revision 은 여기서 읽지 않는다 — 스냅샷과 같은 트랜잭션에서 읽어야 "새 ETag + 옛 데이터"
-// 로 어긋나지 않는다(GetSyncSnapshot 주석 참고).
-func (s *GormStore) GetSyncGate(ctx context.Context, userID string) (bool, int, error) {
+// revision 도 같은 행이라 같이 읽는다. **304 판정에만 쓴다** — 클라이언트가 가진 리비전과
+// 같으면 레코드를 읽지 않고 끝낸다. 리비전은 데이터와 같은 트랜잭션에서 올라가는 단조
+// 카운터라, 같다는 것은 클라이언트가 마지막으로 적용한 스냅샷 뒤로 바뀐 것이 없다는 뜻이다.
+// 이 조회 직후에 커밋된 push 는 다음 폴링이 잡는다 — 스냅샷을 먼저 읽던 때에도 같은 틈이었다.
+//
+// 데이터와 함께 내려주는 ETag 에 이 값을 쓰면 안 된다. 그것은 스냅샷과 같은 트랜잭션에서
+// 읽어야 "새 ETag + 옛 데이터" 로 어긋나지 않는다(GetSyncSnapshot 주석 참고).
+func (s *GormStore) GetSyncGate(ctx context.Context, userID string) (SyncGate, error) {
 	var row userRow
-	err := s.db.WithContext(ctx).Select("sync_data_floor").Where("id = ?", userID).Take(&row).Error
+	err := s.db.WithContext(ctx).Select("sync_data_floor", "sync_revision").Where("id = ?", userID).Take(&row).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return false, 0, nil
+		return SyncGate{}, nil
 	}
 	if err != nil {
-		return false, 0, err
+		return SyncGate{}, err
 	}
-	return true, row.SyncDataFloor, nil
+	return SyncGate{Exists: true, DataFloor: row.SyncDataFloor, Revision: row.SyncRevision}, nil
 }
 
 // DeleteUserData 는 회원 탈퇴용으로 사용자의 모든 행을 단일 트랜잭션으로 hard delete 한다.

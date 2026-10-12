@@ -1008,6 +1008,62 @@ func TestSyncSnapshotIsolationKeepsRevisionAndRecordsTogether(t *testing.T) {
 	}
 }
 
+// 게이트는 users 행 한 번으로 존재·하한·리비전을 읽는다. 리비전은 GET /sync 가 레코드를 읽기
+// 전에 304 를 판정하는 근거라, push 마다 스냅샷이 주는 값과 같이 올라가야 한다.
+func TestGormStoreSyncGateReadsExistenceFloorAndRevision(t *testing.T) {
+	for _, testCase := range storeTestCases() {
+		t.Run(testCase.name, func(t *testing.T) {
+			store := testCase.open(t)
+			ctx := context.Background()
+
+			missing, err := store.GetSyncGate(ctx, "missing-user")
+			if err != nil || missing != (SyncGate{}) {
+				t.Fatalf("gate for a missing user = %#v, %v", missing, err)
+			}
+
+			user, err := store.CreateUser(ctx, "sync-gate@example.com", "hash")
+			if err != nil {
+				t.Fatalf("CreateUser() error = %v", err)
+			}
+			vault, err := store.GetOrCreateUserVaultKey(ctx, user.ID)
+			if err != nil {
+				t.Fatalf("GetOrCreateUserVaultKey() error = %v", err)
+			}
+			before, err := store.GetSyncGate(ctx, user.ID)
+			if err != nil || !before.Exists || before.DataFloor != 0 {
+				t.Fatalf("gate before push = %#v, %v", before, err)
+			}
+
+			pushed, err := store.ApplyPushRecords(ctx, user.ID, syncmodel.Payload{
+				syncmodel.KindHosts: []syncmodel.Record{{
+					ID:               "gate-host",
+					EncryptedPayload: "ciphertext",
+					UpdatedAt:        "2026-10-12T00:00:00Z",
+				}},
+			}, VaultPushFence{Epoch: vault.Epoch, Version: 1})
+			if err != nil {
+				t.Fatalf("ApplyPushRecords() error = %v", err)
+			}
+			if err := store.RaiseSyncDataFloor(ctx, user.ID, 1); err != nil {
+				t.Fatalf("RaiseSyncDataFloor() error = %v", err)
+			}
+
+			after, err := store.GetSyncGate(ctx, user.ID)
+			if err != nil {
+				t.Fatalf("GetSyncGate() error = %v", err)
+			}
+			snapshotRevision, _, err := store.GetSyncSnapshot(ctx, user.ID)
+			if err != nil {
+				t.Fatalf("GetSyncSnapshot() error = %v", err)
+			}
+			if !after.Exists || after.DataFloor != 1 || after.Revision <= before.Revision ||
+				after.Revision != pushed || after.Revision != snapshotRevision {
+				t.Fatalf("gate after push = %#v (before %#v, pushed %d, snapshot %d)", after, before, pushed, snapshotRevision)
+			}
+		})
+	}
+}
+
 // verifier 도입 이전에 만들어진 v2 볼트는 dek_verifier 가 빈 값이다. 잠금해제로 DEK 를
 // 증명한 클라이언트가 rewrap 경로로 지연 백필하고, 이미 값이 있으면 다른 값은 무시된다.
 func TestGormStoreVaultVerifierLazyBackfill(t *testing.T) {

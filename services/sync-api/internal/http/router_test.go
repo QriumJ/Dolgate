@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,6 +35,12 @@ type observingStore struct {
 	vaultStateBarrierMu   sync.Mutex
 	vaultStateObserved    chan struct{}
 	vaultStateReadRelease chan struct{}
+	snapshotReads         atomic.Int64
+}
+
+func (s *observingStore) GetSyncSnapshot(ctx context.Context, userID string) (int64, syncmodel.Payload, error) {
+	s.snapshotReads.Add(1)
+	return s.GormStore.GetSyncSnapshot(ctx, userID)
 }
 
 func (s *observingStore) UpsertUserClientObservation(ctx context.Context, observation store.UserClientObservation) error {
@@ -1511,7 +1518,10 @@ const vaultLegacyClientVersion = "1.7.10"
 
 func TestSyncRevisionETag(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	router := createTestRouter(t)
+	router, observed, _ := createObservedTestRouterWithConfig(t, httpserver.RouterConfig{
+		LocalAuthEnabled:   true,
+		LocalSignupEnabled: true,
+	})
 
 	signup, signupRecorder := vaultTestSession(t, router, http.MethodPost, "/auth/signup",
 		`{"email":"revision@example.com","password":"supersecure"}`, vaultE2EECapableVersion)
@@ -1572,6 +1582,7 @@ func TestSyncRevisionETag(t *testing.T) {
 	}
 
 	// 같은 ETag 로 조건부 GET → 변경 없음 → 304, 본문 없음.
+	snapshotReadsBefore := observed.snapshotReads.Load()
 	notModified := httptest.NewRecorder()
 	req := vaultTestRequest(http.MethodGet, "/sync", "", token, vaultE2EECapableVersion)
 	req.Header.Set("If-None-Match", etag)
@@ -1584,6 +1595,13 @@ func TestSyncRevisionETag(t *testing.T) {
 	}
 	if cacheControl := notModified.Header().Get("Cache-Control"); cacheControl != "no-store" {
 		t.Fatalf("expected Cache-Control no-store on 304, got %q", cacheControl)
+	}
+	if notModified.Header().Get("ETag") != etag {
+		t.Fatalf("expected ETag %q on 304, got %q", etag, notModified.Header().Get("ETag"))
+	}
+	// 폴링 대부분이 304 로 끝난다. 그때 레코드 전부를 읽어 버리면 응답만 가볍고 서버 일은 그대로다.
+	if reads := observed.snapshotReads.Load() - snapshotReadsBefore; reads != 0 {
+		t.Fatalf("expected 304 without reading the snapshot, read it %d time(s)", reads)
 	}
 
 	// 다시 push → 리비전 단조 증가.
@@ -1602,6 +1620,15 @@ func TestSyncRevisionETag(t *testing.T) {
 	}
 	if changed.Header().Get("ETag") != fmt.Sprintf("\"%d\"", rev2) {
 		t.Fatalf("expected new ETag %d, got %q", rev2, changed.Header().Get("ETag"))
+	}
+	var changedBody struct {
+		Hosts []syncmodel.Record `json:"hosts"`
+	}
+	if err := json.Unmarshal(changed.Body.Bytes(), &changedBody); err != nil {
+		t.Fatalf("decode changed snapshot: %v", err)
+	}
+	if len(changedBody.Hosts) != 1 || changedBody.Hosts[0].EncryptedPayload != fmt.Sprintf("c%d", pushSequence) {
+		t.Fatalf("expected the latest pushed host, got %#v", changedBody.Hosts)
 	}
 }
 
@@ -2299,8 +2326,21 @@ func TestSyncDataFloorGatesOnlyAffectedAccounts(t *testing.T) {
 		t.Fatalf("old client push should be gated, got %d", recorder.Code)
 	}
 	// 최신 클라이언트는 계속 정상.
-	if recorder := syncRequest(http.MethodGet, rdpToken, "1.9.0", "", ""); recorder.Code != http.StatusOK {
-		t.Fatalf("current client should sync, got %d: %s", recorder.Code, recorder.Body.String())
+	current := syncRequest(http.MethodGet, rdpToken, "1.9.0", "", "")
+	if current.Code != http.StatusOK {
+		t.Fatalf("current client should sync, got %d: %s", current.Code, current.Body.String())
+	}
+	// 304 판정이 게이트를 건너뛰면 안 된다 — 바뀐 것이 없어도 옛 클라이언트는 426 을 받아야
+	// 업데이트 안내를 본다.
+	unchanged := httptest.NewRequest(http.MethodGet, "/sync", nil)
+	unchanged.Header.Set("Authorization", "Bearer "+rdpToken)
+	unchanged.Header.Set("X-Dolgate-Client", "desktop")
+	unchanged.Header.Set("X-Dolgate-Client-Version", "1.8.10")
+	unchanged.Header.Set("If-None-Match", current.Header().Get("ETag"))
+	unchangedRecorder := httptest.NewRecorder()
+	router.ServeHTTP(unchangedRecorder, unchanged)
+	if unchangedRecorder.Code != http.StatusUpgradeRequired {
+		t.Fatalf("old client with an unchanged ETag should still be gated, got %d", unchangedRecorder.Code)
 	}
 	// 모바일은 게이트 대상이 아니다 — 스토어 배포본이 남아 있고, 모르는 종류를 스스로 걸러낸다.
 	mobile := httptest.NewRequest(http.MethodGet, "/sync", bytes.NewBufferString(""))

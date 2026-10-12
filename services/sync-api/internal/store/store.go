@@ -120,6 +120,16 @@ type VaultPushFence struct {
 	Version int
 }
 
+// SyncGate 는 /sync 요청마다 게이트가 users 행 한 번으로 읽는 값들이다.
+// Exists 가 false 면 탈퇴한 사용자이고, 나머지 값은 0 이다.
+type SyncGate struct {
+	Exists    bool
+	DataFloor int
+	// Revision 은 304 판정에만 쓴다. 데이터와 함께 내려주는 ETag 는 GetSyncSnapshot 이
+	// 같은 트랜잭션에서 다시 읽은 값이어야 한다.
+	Revision int64
+}
+
 // WebAuthnCredential 은 사용자가 등록한 패스키 하나다. Data 는 인증(auth) 계층이 소유하는
 // 불투명한 직렬화 바이트(마샬링된 자격증명)로, 스토어는 WebAuthn 라이브러리에 의존하지 않고
 // 그대로 보관·반환만 한다. CredentialID 는 base64url 로 인코딩된 원본 credential id 다.
@@ -234,9 +244,9 @@ type Store interface {
 	// RaiseSyncDataFloor 는 수준을 올리기만 한다(단조). 이미 같거나 높으면 아무 일도 없다.
 	RaiseSyncDataFloor(ctx context.Context, userID string, floor int) error
 
-	// GetSyncGate 는 /sync 게이트 두 개(존재 여부, 데이터 하한)를 users 행 한 번으로 읽는다.
-	// 행이 없으면 (false, 0, nil) — 탈퇴한 사용자다.
-	GetSyncGate(ctx context.Context, userID string) (bool, int, error)
+	// GetSyncGate 는 /sync 게이트가 보는 값(존재 여부, 데이터 하한, 리비전)을 users 행 한 번으로
+	// 읽는다. 행이 없으면 Exists 가 false 다 — 탈퇴한 사용자다.
+	GetSyncGate(ctx context.Context, userID string) (SyncGate, error)
 
 	// 유저 존재 확인 — 탈퇴 직후 잔여 access 토큰의 sync 재유입(데이터 부활) 차단용.
 	// "행 없음"은 (false, nil), 드라이버 에러만 err 로 돌려준다.

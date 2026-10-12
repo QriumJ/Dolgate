@@ -392,6 +392,15 @@ func highestKnownSyncDataFloor() int {
 	return highest
 }
 
+// 게이트가 읽어 둔 리비전을 GET /sync 의 304 판정에 넘기는 gin 컨텍스트 키.
+const syncGateRevisionContextKey = "dolgate.syncGateRevision"
+
+// syncRevisionETag 는 리비전을 GET /sync 의 ETag 로 만든다. 304 판정과 200 응답이 같은 모양을
+// 써야 한다 — 어긋나면 304 가 영영 안 나고 폴링마다 전체를 받는다.
+func syncRevisionETag(revision int64) string {
+	return fmt.Sprintf("\"%d\"", revision)
+}
+
 // 구버전 클라이언트에 v2 계정 세션을 거부할 때 내려주는 안내. 데스크톱의
 // normalizeAuthInvalidErrorMessage 치환 패턴(unauthorized|로그인이 필요|세션이 만료 등)에
 // 걸리지 않는 문구여야 원문 그대로 로그인 화면에 표시된다. 상태코드도 같은 이유로
@@ -1627,9 +1636,10 @@ func NewRouter(store store.Store, authService *auth.Service, config RouterConfig
 	// 쪽보다 낫다고 보고 택했다.
 	//
 	// 존재 확인과 하한 조회는 users 행 하나를 보는 같은 일이라 한 번의 조회로 합쳤다(GetSyncGate).
-	// 폴링이 30초 주기라 기기 수만큼 곱해지는 왕복이다 — 나뉘어 있을 이유가 없다.
+	// 폴링이 30초 주기라 기기 수만큼 곱해지는 왕복이다 — 나뉘어 있을 이유가 없다. 같은 행의
+	// 리비전도 이때 받아 GET 의 304 판정에 넘긴다.
 	syncGroup.Use(func(ctx *gin.Context) {
-		exists, floor, err := store.GetSyncGate(ctx.Request.Context(), ctx.GetString("userId"))
+		gate, err := store.GetSyncGate(ctx.Request.Context(), ctx.GetString("userId"))
 		if err != nil {
 			logAndJSONError(ctx, http.StatusInternalServerError, "서버 오류가 발생했습니다.", err)
 			ctx.Abort()
@@ -1637,17 +1647,30 @@ func NewRouter(store store.Store, authService *auth.Service, config RouterConfig
 		}
 		// 탈퇴 직후 아직 만료 전 access 토큰을 가진 기기의 쓰기(지운 데이터 부활, 볼트 재생성)를
 		// 막고, 그 기기의 즉시 로그아웃(401 → refresh 실패)을 유도한다.
-		if !exists {
+		if !gate.Exists {
 			ctx.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "로그인이 필요합니다."})
 			return
 		}
-		if rejectOutdatedClientForFloor(ctx, floor) {
+		if rejectOutdatedClientForFloor(ctx, gate.DataFloor) {
 			return
 		}
+		ctx.Set(syncGateRevisionContextKey, gate.Revision)
 		ctx.Next()
 	})
 	syncGroup.GET("", func(ctx *gin.Context) {
 		userID := ctx.GetString("userId")
+
+		// 변경 없음 → 본문 없이 304. 폴링 대부분이 여기서 끝나므로 레코드를 읽기 **전에**
+		// 판정한다. 예전에는 스냅샷(그 사용자의 레코드 전부, 암호문까지)을 다 읽은 뒤 ETag 를
+		// 견줘 버렸다 — 응답만 가볍고 서버 일은 그대로였다. 리비전은 게이트가 같은 users 행에서
+		// 이미 읽어 왔다(GetSyncGate 주석 참고).
+		// (구버전 클라는 If-None-Match 를 안 보내므로 항상 200 전체를 받는다.)
+		gateETag := syncRevisionETag(ctx.GetInt64(syncGateRevisionContextKey))
+		if match := strings.TrimSpace(ctx.GetHeader("If-None-Match")); match != "" && match == gateETag {
+			ctx.Header("ETag", gateETag)
+			ctx.Status(http.StatusNotModified)
+			return
+		}
 
 		// revision + 모든 kind 를 단일 읽기 트랜잭션으로 일관 스냅샷으로 읽는다.
 		// revision 과 데이터가 어긋나(새 ETag + 옛 데이터) 변경을 놓치는 일이 없도록 한다.
@@ -1656,14 +1679,7 @@ func NewRouter(store store.Store, authService *auth.Service, config RouterConfig
 			logAndJSONError(ctx, http.StatusInternalServerError, "서버 오류가 발생했습니다.", err)
 			return
 		}
-		etag := fmt.Sprintf("\"%d\"", revision)
-		ctx.Header("ETag", etag)
-		// 변경 없음 → 본문 없이 304. 폴링이 idle 일 때 초경량이 되는 지점이다.
-		// (구버전 클라는 If-None-Match 를 안 보내므로 항상 200 전체를 받는다.)
-		if match := strings.TrimSpace(ctx.GetHeader("If-None-Match")); match != "" && match == etag {
-			ctx.Status(http.StatusNotModified)
-			return
-		}
+		ctx.Header("ETag", syncRevisionETag(revision))
 
 		// 빈 kind 는 맵에 키가 없다. 이미 배포된 클라이언트를 위해 응답에서만 옛 모양
 		// (모든 레거시 kind 가 빈 배열로라도 존재)을 유지한다 — WithLegacyWireKinds 주석 참고.
