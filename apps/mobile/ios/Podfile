@@ -39,6 +39,12 @@ target 'Dolgate' do
     installer.pods_project.targets.each do |target|
       target.build_configurations.each do |build_configuration|
         build_configuration.build_settings['CLANG_ALLOW_NON_MODULAR_INCLUDES_IN_FRAMEWORK_MODULES'] = 'YES'
+        # Xcode 27 은 iOS 15 미만 배포 대상을 빌드 오류로 막는다. RN 은 일반 Pod 타깃만 앱 최소
+        # 버전으로 올려 주고, 리소스 번들 타깃(AsyncStorage_resources 등)은 podspec 의 값(13.0)이
+        # 그대로 남는다. 앱 최소 버전보다 낮은 것만 올린다.
+        if build_configuration.build_settings['IPHONEOS_DEPLOYMENT_TARGET'].to_f < min_ios_version_supported.to_f
+          build_configuration.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = min_ios_version_supported
+        end
       end
     end
 
