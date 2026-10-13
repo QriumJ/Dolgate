@@ -1288,6 +1288,54 @@ describe("createAppStore sessions and auth recovery", () => {
     expect(store.getState().tabs[0]?.sessionId).toBe("ecs-shell-2");
   });
 
+  // 재시도는 다시 연결될 때까지 탭을 대기 탭으로 바꿔 둔다. 그동안에도 ECS 탭이어야 한다 — 빠지면
+  // 로컬 셸로 보여 Windows 에서 ConPTY 세션으로 판정됐다(isConptyHostedTab). 연결이 끝나면 다시
+  // 채워지므로, 끝나기 전에 봐야 잡힌다.
+  it("keeps the ECS exec shell kind while a retry is still connecting", async () => {
+    const api = createMockApi();
+    let finishRetry: (value: { sessionId: string }) => void = () => undefined;
+    api.aws.openEcsExecShell = vi
+      .fn()
+      .mockResolvedValueOnce({ sessionId: "ecs-shell-1" })
+      .mockImplementationOnce(
+        () =>
+          new Promise<{ sessionId: string }>((resolve) => {
+            finishRetry = resolve;
+          }),
+      );
+    const store = createAppStore(api);
+
+    await store.getState().bootstrap();
+    store.setState((state) => ({
+      hosts: [...state.hosts, createEcsHost()],
+    }));
+    await store.getState().openEcsExecShell(
+      "ecs-host-1",
+      "api",
+      "arn:aws:ecs:ap-northeast-2:123456789012:task/prod/api-1",
+      "api",
+    );
+    store.getState().handleCoreEvent({
+      type: "error",
+      sessionId: "ecs-shell-1",
+      payload: {
+        message: "Process exited with status 127",
+      },
+    });
+
+    const retry = store.getState().retrySessionConnection("ecs-shell-1");
+    expect(store.getState().tabs[0]?.status).toBe("pending");
+    expect(store.getState().tabs[0]?.shellKind).toBe("aws-ecs-exec");
+
+    await vi.waitFor(() => {
+      expect(api.aws.openEcsExecShell).toHaveBeenCalledTimes(2);
+    });
+    finishRetry({ sessionId: "ecs-shell-2" });
+    await retry;
+    expect(store.getState().tabs[0]?.sessionId).toBe("ecs-shell-2");
+    expect(store.getState().tabs[0]?.shellKind).toBe("aws-ecs-exec");
+  });
+
   it("closes a missing-shell ECS exec session through the standard close action", async () => {
     const api = createMockApi();
     api.aws.openEcsExecShell = vi

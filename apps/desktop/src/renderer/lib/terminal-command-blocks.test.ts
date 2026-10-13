@@ -1470,4 +1470,46 @@ describe('ConPTY 가 다시 그린 뒤 블록 위치 맞추기 (실제 xterm)', 
       terminal.dispose();
     }
   });
+
+  // 맞추기는 리사이즈 때마다 돌고, 대부분은 아무것도 밀리지 않은 경우다. 그때 출력 속에 명령 줄과
+  // 똑같은 줄이 있으면(터미널 기록 파일을 `type` 으로 볼 때 등) 위로 찾다가 그 줄을 먼저 만나 블록이
+  // 출력으로 옮겨 갔다.
+  it('밀리지 않았으면 출력에 명령 줄과 같은 줄이 있어도 블록은 제자리에 있다', async () => {
+    const terminal = new HeadlessTerminal({
+      cols: 40,
+      rows: 10,
+      scrollback: 100,
+      allowProposedApi: true,
+      windowsPty: { backend: 'conpty' },
+    });
+    (terminal as unknown as { registerDecoration: () => undefined }).registerDecoration = () =>
+      undefined;
+    const term = terminal as unknown as Terminal;
+    const write = (data: string) =>
+      new Promise<void>((resolve) => {
+        terminal.write(data, resolve);
+      });
+    const lineText = (line: number) =>
+      terminal.buffer.active.getLine(line)?.translateToString(true);
+
+    try {
+      await write('PS> ');
+      notePromptCommandStart(session, term);
+      await write('type session.log\r\n');
+      beginCommandBlock(session, term, null);
+      await write('line-a\r\nPS> type session.log\r\nline-b\r\n');
+      finishCommandBlock(session, term, 0);
+      await write('PS> ');
+      notePromptCommandStart(session, term);
+
+      const [block] = getCommandBlocks(session);
+      const commandLine = block.marker.line;
+      expect(lineText(commandLine)).toBe('PS> type session.log');
+
+      expect(realignCommandBlocks(session, term)).toBe(0);
+      expect(block.marker.line).toBe(commandLine);
+    } finally {
+      terminal.dispose();
+    }
+  });
 });

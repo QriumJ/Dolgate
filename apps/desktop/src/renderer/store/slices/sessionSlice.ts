@@ -770,6 +770,9 @@ export function createSessionSlice(deps: SliceDeps): SessionSlice {
                 source: "local",
                 hostId: null,
                 title: tab.title,
+                // 다시 연결되는 동안에도 ECS 탭이다. 빠지면 로컬 셸로 보인다 — Windows 에서는
+                // ConPTY 세션으로 판정된다(isConptyHostedTab).
+                shellKind: "aws-ecs-exec",
                 progress: createConnectionProgress(
                   "retrying-session",
                   t("sessionStore.ecsShellReopening", { label: host.label }),

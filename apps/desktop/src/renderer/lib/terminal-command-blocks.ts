@@ -960,8 +960,9 @@ function jumpToAdjacentCommandBlockUnsafe(
  *
  * 찾는 법: 가장 최근 블록부터 거꾸로, 블록을 만들 때 적어 둔 명령 줄 텍스트와 같은 줄을 바로 다음
  * (더 최근) 블록 줄의 위에서부터 위로 찾는다. 두 블록 사이에는 이 블록의 출력만 있으므로 처음 만나는
- * 같은 줄이 이 블록이다 — 같은 명령을 연달아 쳐도 섞이지 않는다. 출력에 명령 줄과 똑같은 줄이
- * 있으면 그 줄로 잘못 갈 수 있다. 못 찾으면 옮기지 않는다.
+ * 같은 줄이 이 블록이다 — 같은 명령을 연달아 쳐도 섞이지 않는다. 바로 뒤 기준(지금 프롬프트, 그다음은
+ * 더 최근 블록)이 제자리였고 마커 줄이 아직 그 명령 줄이면 찾지 않고 제자리로 둔다. 실제로 밀렸을 때
+ * 출력에 명령 줄과 똑같은 줄이 있으면 그 줄로 잘못 갈 수 있다. 못 찾으면 옮기지 않는다.
  *
  * 스크롤백에서 제자리가 맞는 블록을 만나면 멈춘다 — ConPTY 는 활성 화면만 다시 그리므로 그보다
  * 오래된 블록은 영향받지 않는다.
@@ -982,6 +983,8 @@ function realignCommandBlocksUnsafe(sessionId: string, terminal: Terminal): numb
 
   // 블록의 명령 줄은 이 줄보다 위에 있다. 처음에는 커서 줄(지금 프롬프트)이다.
   let upperBound = cursorLine;
+  // 바로 뒤 기준(지금 프롬프트, 그다음은 더 최근 블록)이 옮겨 간 거리. 모르면 null.
+  let shift: number | null = null;
 
   // 입력 중인 프롬프트(B 는 왔고 C 는 아직)도 옮긴다. 안 옮기면 다음 명령의 블록이 엉뚱한 줄에
   // 생기고 명령 텍스트도 그 줄에서 읽는다. 지금 프롬프트는 커서 줄이거나 그 위(여러 줄 입력)이고
@@ -995,6 +998,7 @@ function realignCommandBlocksUnsafe(sessionId: string, terminal: Terminal): numb
     );
     if (promptLine >= 0) {
       const delta = promptLine - pending.marker.line;
+      shift = delta;
       const moved = delta === 0 ? null : terminal.registerMarker(promptLine - cursorLine);
       if (moved) {
         pending.marker.dispose();
@@ -1015,14 +1019,23 @@ function realignCommandBlocksUnsafe(sessionId: string, terminal: Terminal): numb
     if (current < 0 || expected === null) {
       continue;
     }
-    const found = findLineUpward(
-      Math.min(upperBound - 1, current + reach),
-      Math.max(0, current - reach),
-      (line) => lineTextForMatch(buffer, line) === expected,
-    );
+    // 바로 뒤 기준이 제자리였고 마커 줄이 아직 그 명령 줄이면 이 블록도 제자리다 — 찾지 않는다. 위로
+    // 찾으면 출력 속에 명령 줄과 똑같은 줄이 있을 때 그 줄을 먼저 만나, 아무것도 밀리지 않았는데 블록이
+    // 출력으로 옮겨 갔다(맞추기는 리사이즈마다 돌고 대부분은 밀리지 않은 경우다). 기준이 움직였으면
+    // 이렇게 보지 않는다: 같은 명령을 연달아 쳤는데 줄이 아래로 밀리면, 마커 줄에 앞 블록의 같은 명령
+    // 줄이 와 있다.
+    const found =
+      shift === 0 && current < upperBound && lineTextForMatch(buffer, current) === expected
+        ? current
+        : findLineUpward(
+            Math.min(upperBound - 1, current + reach),
+            Math.max(0, current - reach),
+            (line) => lineTextForMatch(buffer, line) === expected,
+          );
     if (found < 0) {
       continue;
     }
+    shift = found - current;
     if (found === current) {
       if (current < buffer.baseY) {
         break;
